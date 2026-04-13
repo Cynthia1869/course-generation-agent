@@ -1,5 +1,6 @@
 {
   "compilerOptions": {
+    "baseUrl": "../../frontend",
     "target": "ES2022",
     "module": "ESNext",
     "moduleResolution": "Bundler",
@@ -8,10 +9,14 @@
     "resolveJsonModule": true,
     "isolatedModules": true,
     "esModuleInterop": true,
-    "typeRoots": ["./node_modules/@types"],
-    "types": ["vite/client", "node"],
+    "typeRoots": ["../../frontend/node_modules/@types"],
+    "types": ["node"],
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "skipLibCheck": true
   },
-  "include": ["src/**/*.ts", "src/**/*.vue", "src/**/*.d.ts"]
+  "include": [
+    "../../frontend/src/**/*.ts",
+    "../../frontend/src/**/*.vue",
+    "../../frontend/src/**/*.d.ts"
+  ]
 }

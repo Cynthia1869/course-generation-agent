@@ -1,0 +1,4 @@
+chat_model: deepseek-chat
+review_model: deepseek-chat
+chat_temperature: 0.4
+review_temperature: 0.1

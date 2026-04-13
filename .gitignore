@@ -1,4 +1,5 @@
 .DS_Store
+.idea/
 .env
 .venv/
 __pycache__/
@@ -7,6 +8,7 @@ __pycache__/
 .ruff_cache/
 backend/.pytest_cache/
 backend/.ruff_cache/
+backend/*.egg-info/
 backend/*.db
 course_agent.db
 .data/

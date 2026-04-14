@@ -6,6 +6,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 os.environ["APP_ENV"] = "test"
+os.environ["DEEPSEEK_API_KEY"] = ""
 API_ROOT = Path(__file__).resolve().parents[1]
 if str(API_ROOT) not in sys.path:
     sys.path.insert(0, str(API_ROOT))
@@ -23,7 +24,7 @@ async def test_thread_lifecycle():
 
         sent = await client.post(
             f"/api/v1/threads/{thread_id}/messages",
-            json={"content": "我要做一节企业内训课，主题是提示词设计，学员是运营团队。"},
+            json={"content": "我要做一节面向初中生的数学课，先聚焦初二三角函数。"},
         )
         assert sent.status_code == 200
 
@@ -39,9 +40,10 @@ async def test_thread_generation_persists_artifact_and_review_batch():
     thread = await service.create_thread()
     await service.ingest_message(
         thread.thread_id,
-        "我要做一节企业内训课，主题是提示词设计，学员是运营团队，目标是能写出稳定提示词，时长90分钟，限制是要基于真实案例。",
+        "我要做一节面向初中生的数学思维训练课，年级是初二，主题是三角函数，目标是让学生能看懂并完成基础题，时长90分钟，限制是要基于真实案例。",
         "default-user",
     )
+    await service.ingest_message(thread.thread_id, "开始生成", "default-user")
     state = await service.store.get_thread(thread.thread_id)
     assert state.draft_artifact is not None
     assert state.review_batches
@@ -106,9 +108,10 @@ async def test_low_score_triggers_auto_optimization_loop(monkeypatch: pytest.Mon
     thread = await service.create_thread()
     await service.ingest_message(
         thread.thread_id,
-        "我要做一节企业内训课，主题是提示词设计，学员是运营团队，目标是能写出稳定提示词，时长90分钟，限制是要基于真实案例。",
+        "我要做一节面向初中生的数学思维训练课，年级是初二，主题是三角函数，目标是让学生能看懂并完成基础题，时长90分钟，限制是要基于真实案例。",
         "default-user",
     )
+    await service.ingest_message(thread.thread_id, "开始生成", "default-user")
     state = await service.store.get_thread(thread.thread_id)
     assert calls["review"] >= 2
     assert calls["improve"] == 1

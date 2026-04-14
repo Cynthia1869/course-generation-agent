@@ -7,6 +7,12 @@ from uuid import uuid4
 from app.core.schemas import DraftArtifact, ReviewBatch, SourceDocument, ThreadState, ThreadStatus, ThreadSummary
 
 
+class ThreadNotFoundError(KeyError):
+    def __init__(self, thread_id: str) -> None:
+        super().__init__(thread_id)
+        self.thread_id = thread_id
+
+
 class ThreadStore:
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
@@ -21,7 +27,10 @@ class ThreadStore:
 
     async def get_thread(self, thread_id: str) -> ThreadState:
         async with self._lock:
-            return self._threads[thread_id]
+            try:
+                return self._threads[thread_id]
+            except KeyError as exc:
+                raise ThreadNotFoundError(thread_id) from exc
 
     async def save_thread(self, state: ThreadState) -> ThreadState:
         async with self._lock:

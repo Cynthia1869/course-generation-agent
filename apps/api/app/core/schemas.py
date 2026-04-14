@@ -22,6 +22,7 @@ class MessageRole(str, Enum):
 class ThreadStatus(str, Enum):
     COLLECTING = "collecting_requirements"
     GENERATING = "generating"
+    PAUSED = "paused"
     REVIEW_PENDING = "review_pending"
     REVISING = "revising"
     COMPLETED = "completed"
@@ -186,6 +187,7 @@ class ThreadState(BaseModel):
     thread_id: str
     user_id: str = "default-user"
     status: ThreadStatus = ThreadStatus.COLLECTING
+    requirements_confirmed: bool = False
     messages: list[MessageRecord] = Field(default_factory=list)
     requirement_slots: dict[str, RequirementSlot] = Field(default_factory=dict)
     decision_ledger: list[DecisionItem] = Field(default_factory=list)
@@ -196,6 +198,29 @@ class ThreadState(BaseModel):
     approved_feedback: list[HumanReviewAction] = Field(default_factory=list)
     version_chain: list[VersionRecord] = Field(default_factory=list)
     run_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ThreadHistoryEntry(BaseModel):
+    checkpoint_id: str | None = None
+    next_nodes: list[str] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    values: dict[str, Any] = Field(default_factory=dict)
+
+
+class DecisionTrainingRecord(BaseModel):
+    record_id: str = Field(default_factory=lambda: uuid4().hex)
+    thread_id: str
+    suggestion_id: str
+    criterion_id: str | None = None
+    user_message_context: str
+    decision_summary: str
+    draft_excerpt: str
+    model_problem: str
+    model_suggestion: str
+    human_action: str
+    edited_suggestion: str | None = None
+    reviewer_id: str = "default-user"
+    created_at: datetime = Field(default_factory=utc_now)
 
 
 class ApiEnvelope(BaseModel):

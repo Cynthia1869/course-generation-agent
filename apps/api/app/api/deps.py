@@ -5,6 +5,7 @@ from app.core.settings import Settings, get_settings
 from app.files.parser import DocumentParser
 from app.llm.deepseek_client import DeepSeekClient
 from app.services.course_agent import CourseAgentService
+from app.services.decision_model import DecisionModelService
 from app.storage.thread_store import ThreadStore
 from app.workflows.course_graph import CourseGraph
 
@@ -31,3 +32,9 @@ def get_service() -> CourseAgentService:
         parser=parser,
         graph=graph,
     )
+
+
+@lru_cache
+def get_decision_model_service() -> DecisionModelService:
+    settings: Settings = get_settings()
+    return DecisionModelService(settings)

@@ -1,13 +1,30 @@
 const configuredBase = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "");
 const API_BASE = configuredBase || "/api/v1";
 
+export class ApiError extends Error {
+  status: number;
+  detail: unknown;
+
+  constructor(status: number, detail: unknown) {
+    super(`Request failed: ${status}`);
+    this.status = status;
+    this.detail = detail;
+  }
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     headers: { "Content-Type": "application/json", ...(init?.headers ?? {}) },
     ...init,
   });
   if (!response.ok) {
-    throw new Error(`Request failed: ${response.status}`);
+    let detail: unknown = null;
+    try {
+      detail = await response.json();
+    } catch {
+      detail = null;
+    }
+    throw new ApiError(response.status, detail);
   }
   const json = await response.json();
   return json.data as T;
@@ -46,12 +63,18 @@ export async function submitReview(threadId: string, batchId: string, reviewActi
   });
 }
 
+export async function retractLastMessage(threadId: string) {
+  return request(`/threads/${threadId}/messages/last`, { method: "DELETE" });
+}
+
 export function streamThread(threadId: string, onEvent: (event: MessageEvent, type: string) => void) {
   const source = new EventSource(`${API_BASE}/threads/${threadId}/stream`);
-  ["assistant_message", "token_stream", "node_update", "review_batch", "artifact_updated", "audit_event", "file_uploaded"].forEach(
-    (type) => {
-      source.addEventListener(type, (event) => onEvent(event as MessageEvent, type));
-    },
-  );
+  [
+    "assistant_message", "assistant_token", "assistant_stream_end", "token_stream", "node_update",
+    "review_batch", "artifact_updated", "audit_event",
+    "file_uploaded", "message_retracted",
+  ].forEach((type) => {
+    source.addEventListener(type, (event) => onEvent(event as MessageEvent, type));
+  });
   return source;
 }

@@ -2,8 +2,9 @@
 import { computed, nextTick, onMounted, onUnmounted, ref } from "vue";
 import { marked } from "marked";
 import {
+  ApiError,
   createThread, fetchDiff, fetchThread,
-  sendMessage, streamThread, submitReview,
+  retractLastMessage, sendMessage, streamThread, submitReview,
 } from "./lib/api";
 import type { ReviewBatch, ThreadState } from "./types";
 
@@ -20,6 +21,18 @@ const reviewDraft = ref<Record<string, { action: "approve" | "edit" | "reject"; 
 const eventSrc    = ref<EventSource | null>(null);
 const scrollEl    = ref<HTMLDivElement | null>(null);
 const inputEl     = ref<HTMLTextAreaElement | null>(null);
+const streamingAssistant = ref("");
+const streamingAssistantActive = ref(false);
+
+// ── streaming / processing state ───────────────────────────────────────────
+const streamingMarkdown = ref("");   // accumulates token_stream chunks in real-time
+const processing        = ref(false); // true while backend is working (after send, before response)
+
+const displayMarkdownHtml = computed(() => {
+  const md = streamingMarkdown.value || threadState.value?.draft_artifact?.markdown || "";
+  return marked.parse(md) as string;
+});
+const isStreaming = computed(() => !!streamingMarkdown.value);
 
 // ── panel resize ───────────────────────────────────────────────────────────
 const chatW    = ref(440);
@@ -40,6 +53,15 @@ function startResize(e: MouseEvent) {
 }
 
 const messages     = computed(() => threadState.value?.messages ?? []);
+const visibleMessages = computed(() => {
+  if (!streamingAssistantActive.value) return messages.value;
+  const cloned = [...messages.value];
+  const last = cloned[cloned.length - 1];
+  if (last?.role === "assistant") {
+    return cloned.slice(0, -1);
+  }
+  return cloned;
+});
 const latestReview = computed<ReviewBatch | null>(() => {
   const b = threadState.value?.review_batches ?? [];
   return b.length ? b[b.length - 1] : null;
@@ -47,8 +69,30 @@ const latestReview = computed<ReviewBatch | null>(() => {
 const markdownHtml = computed(() =>
   marked.parse(threadState.value?.draft_artifact?.markdown ?? ""),
 );
-const hasContent  = computed(() => !!threadState.value?.draft_artifact?.markdown);
-const isEmpty     = computed(() => messages.value.length === 0 && !booting.value);
+function renderAssistantMessage(content: string) {
+  const normalized = content
+    .replace(/\n{3,}/g, "\n\n")
+    .replace(/[ \t]+\n/g, "\n")
+    .trim();
+  return marked.parse(normalized) as string;
+}
+function renderUserMessage(content: string) {
+  return content.replace(/\n{3,}/g, "\n\n").trim();
+}
+const hasContent = computed(() =>
+  !!(threadState.value?.draft_artifact?.markdown || streamingMarkdown.value),
+);
+const isEmpty    = computed(() => messages.value.length === 0 && !booting.value);
+// Whether the last message is user's and the thread is still collecting (retract is safe)
+const canRetract = computed(() => {
+  const msgs = messages.value;
+  return (
+    !processing.value &&
+    msgs.length > 0 &&
+    msgs[msgs.length - 1].role === "user" &&
+    threadState.value?.status === "collecting_requirements"
+  );
+});
 
 // ── bootstrap ─────────────────────────────────────────────────────────────
 async function bootstrap() {
@@ -56,20 +100,53 @@ async function bootstrap() {
   bootError.value = "";
   try {
     const { thread } = await createThread();
-    threadId.value = thread.thread_id;
-    await refreshThread();
-    eventSrc.value = streamThread(threadId.value, async (_e, type) => {
-      if (["assistant_message","artifact_updated","review_batch","node_update"].includes(type)) {
-        await refreshThread();
-        scrollBottom();
-      }
-    });
+    await openThread(thread.thread_id);
   } catch (e) {
     bootError.value = "连接失败，请刷新页面重试。";
     console.error(e);
   } finally {
     booting.value = false;
   }
+}
+
+async function openThread(newThreadId: string) {
+  eventSrc.value?.close();
+  threadId.value = newThreadId;
+  await refreshThread();
+  eventSrc.value = streamThread(threadId.value, async (e, type) => {
+    if (type === "assistant_token") {
+      const data = JSON.parse(e.data) as { content: string };
+      streamingAssistantActive.value = true;
+      streamingAssistant.value += data.content;
+      scrollBottom();
+    } else if (type === "assistant_stream_end") {
+      processing.value = false;
+      await refreshThread();
+      streamingAssistant.value = "";
+      streamingAssistantActive.value = false;
+      scrollBottom();
+    } else if (type === "token_stream") {
+      const data = JSON.parse(e.data) as { content: string };
+      streamingMarkdown.value += data.content;
+    } else if (type === "assistant_message") {
+      processing.value = false;
+      streamingMarkdown.value = "";
+      await refreshThread();
+      scrollBottom();
+    } else if (type === "artifact_updated") {
+      processing.value = false;
+      streamingMarkdown.value = "";
+      await refreshThread();
+      scrollBottom();
+    } else if (type === "message_retracted") {
+      processing.value = false;
+      streamingMarkdown.value = "";
+      await refreshThread();
+    } else if (["review_batch", "node_update"].includes(type)) {
+      await refreshThread();
+      scrollBottom();
+    }
+  });
 }
 
 async function refreshThread() {
@@ -82,20 +159,37 @@ async function refreshThread() {
   }
 }
 
+function isThreadNotFound(error: unknown) {
+  return error instanceof ApiError && error.status === 404;
+}
+
+async function recreateThreadAndReconnect() {
+  const { thread } = await createThread();
+  await openThread(thread.thread_id);
+}
+
 onMounted(bootstrap);
 onUnmounted(() => eventSrc.value?.close());
 
 // ── send ───────────────────────────────────────────────────────────────────
 async function handleSend() {
   const text = content.value.trim();
-  if (!text || sending.value || !threadId.value) return;
+  if (!text || sending.value || processing.value || !threadId.value) return;
   sending.value = true;
   content.value = "";
   resetHeight();
   try {
     await sendMessage(threadId.value, text);
+    processing.value = true; // backend is now working
     scrollBottom();
-  } catch {
+  } catch (error) {
+    if (isThreadNotFound(error)) {
+      await recreateThreadAndReconnect();
+      await sendMessage(threadId.value, text);
+      processing.value = true;
+      scrollBottom();
+      return;
+    }
     content.value = text;
   } finally {
     sending.value = false;
@@ -121,6 +215,36 @@ function scrollBottom() {
   nextTick(() => {
     if (scrollEl.value) scrollEl.value.scrollTop = scrollEl.value.scrollHeight;
   });
+}
+
+// ── retract ────────────────────────────────────────────────────────────────
+async function retractMessage() {
+  if (!canRetract.value || !threadId.value) return;
+  try {
+    await retractLastMessage(threadId.value);
+  } catch (error) {
+    if (isThreadNotFound(error)) {
+      await recreateThreadAndReconnect();
+      return;
+    }
+    console.error(error);
+  }
+}
+
+// ── new conversation ────────────────────────────────────────────────────────
+async function newConversation() {
+  eventSrc.value?.close();
+  eventSrc.value = null;
+  threadId.value = "";
+  threadState.value = null;
+  streamingMarkdown.value = "";
+  processing.value = false;
+  bootError.value = "";
+  content.value = "";
+  diffText.value = "";
+  activeTab.value = "preview";
+  reviewDraft.value = {};
+  await bootstrap();
 }
 
 // ── review ─────────────────────────────────────────────────────────────────
@@ -167,6 +291,11 @@ function fillChip(text: string) {
           <span v-if="threadState?.draft_artifact" class="artifact-version">
             v{{ threadState.draft_artifact.version }}
           </span>
+          <!-- streaming badge -->
+          <span v-if="isStreaming" class="artifact-generating">
+            <span class="gen-dot" /><span class="gen-dot" /><span class="gen-dot" />
+            生成中
+          </span>
         </div>
         <div class="tab-row" role="tablist">
           <button role="tab" :aria-selected="activeTab==='preview'" :class="['tab',{on:activeTab==='preview'}]" @click="activeTab='preview'">预览</button>
@@ -184,7 +313,8 @@ function fillChip(text: string) {
               <p class="artifact-empty-h">课程内容将在这里显示</p>
               <p class="artifact-empty-p">在右侧与 AI 对话后，生成的课程内容会实时呈现在此。</p>
             </div>
-            <div v-else class="prose" v-html="markdownHtml" />
+            <div v-else class="prose" v-html="displayMarkdownHtml" />
+            <div v-if="isStreaming" class="stream-cursor" aria-hidden="true" />
           </div>
           <pre v-else key="diff" class="diff-view">{{ diffText || "暂无版本差异。" }}</pre>
         </Transition>
@@ -226,15 +356,22 @@ function fillChip(text: string) {
 
       <!-- Top bar -->
       <div class="chat-topbar">
+        <button class="new-chat-btn" :disabled="booting" @click="newConversation" title="新对话">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" aria-hidden="true">
+            <path d="M12 5v14M5 12h14"/>
+          </svg>
+          新对话
+        </button>
         <div class="model-chip">
           <div class="claude-logo" aria-hidden="true">
             <img src="/icon.png" width="22" height="22" alt="" style="display:block;border-radius:4px;" />
           </div>
           <span class="model-name">制课 Agent</span>
-          <span :class="['model-status', bootError ? 'err' : booting ? 'loading' : 'ok']">
-            {{ bootError ? '连接失败' : booting ? '连接中' : '就绪' }}
+          <span :class="['model-status', bootError ? 'err' : booting || processing ? 'loading' : 'ok']">
+            {{ bootError ? '连接失败' : booting ? '连接中' : processing ? '思考中' : '就绪' }}
           </span>
         </div>
+        <div class="topbar-spacer" aria-hidden="true" />
       </div>
 
       <!-- Messages scroll area -->
@@ -268,11 +405,22 @@ function fillChip(text: string) {
 
           <!-- Message list with entrance animations -->
           <TransitionGroup name="t-msg" tag="div" class="msg-list">
-            <div v-for="msg in messages" :key="msg.message_id" :class="['msg', msg.role]">
+            <div v-for="msg in visibleMessages" :key="msg.message_id" :class="['msg', msg.role]">
 
               <!-- USER -->
               <div v-if="msg.role==='user'" class="user-row">
-                <div class="user-bubble">{{ msg.content }}</div>
+                <button
+                  v-if="canRetract && msg === messages[messages.length - 1]"
+                  class="retract-btn"
+                  title="撤回"
+                  @click="retractMessage"
+                >
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                    <path d="M9 14 4 9l5-5"/><path d="M4 9h10.5a5.5 5.5 0 0 1 0 11H11"/>
+                  </svg>
+                  撤回
+                </button>
+                <div class="user-bubble">{{ renderUserMessage(msg.content) }}</div>
               </div>
 
               <!-- ASSISTANT -->
@@ -282,23 +430,41 @@ function fillChip(text: string) {
                 </div>
                 <div class="ai-body">
                   <span class="ai-name">制课 Agent</span>
-                  <p class="ai-text">{{ msg.content }}</p>
+                  <div class="ai-text" v-html="renderAssistantMessage(msg.content)" />
                 </div>
               </div>
 
             </div>
           </TransitionGroup>
 
-          <!-- Typing indicator -->
           <Transition name="t-fade">
-            <div v-if="sending" class="msg assistant">
+            <div v-if="streamingAssistantActive" class="msg assistant">
               <div class="ai-row">
                 <div class="ai-avatar" aria-hidden="true">
                   <img src="/icon.png" width="16" height="16" alt="" style="display:block;border-radius:3px;" />
                 </div>
                 <div class="ai-body">
                   <span class="ai-name">制课 Agent</span>
-                  <div class="typing"><span /><span /><span /></div>
+                  <div class="ai-text" v-html="renderAssistantMessage(streamingAssistant)" />
+                </div>
+              </div>
+            </div>
+          </Transition>
+
+          <!-- Typing / thinking indicator -->
+          <Transition name="t-fade">
+            <div v-if="(sending || processing) && !streamingAssistantActive" class="msg assistant">
+              <div class="ai-row">
+                <div class="ai-avatar" aria-hidden="true">
+                  <img src="/icon.png" width="16" height="16" alt="" style="display:block;border-radius:3px;" />
+                </div>
+                <div class="ai-body">
+                  <span class="ai-name">制课 Agent</span>
+                  <div v-if="processing && !sending" class="thinking-indicator">
+                    <div class="thinking-orb" />
+                    <span class="thinking-label">正在思考…</span>
+                  </div>
+                  <div v-else class="typing"><span /><span /><span /></div>
                 </div>
               </div>
             </div>
@@ -316,14 +482,14 @@ function fillChip(text: string) {
             class="composer-ta"
             placeholder="给制课 Agent 发送消息…"
             rows="1"
-            :disabled="!!bootError || booting"
+            :disabled="!!bootError || booting || processing"
             @keydown="handleKeydown"
             @input="autoResize"
             aria-label="输入消息"
           />
           <button
             :class="['send-btn', { active: !!content.trim() && !sending }]"
-            :disabled="!content.trim() || sending || booting || !!bootError"
+            :disabled="!content.trim() || sending || booting || !!bootError || processing"
             :aria-label="sending ? '发送中' : '发送'"
             @click="handleSend"
           >
@@ -394,6 +560,30 @@ function fillChip(text: string) {
   gap: 12px;
 }
 
+/* ── topbar layout ── */
+.chat-topbar {
+  justify-content: space-between !important;
+}
+
+.new-chat-btn {
+  display: flex; align-items: center; gap: 5px;
+  background: none; border: 1px solid #e8e6dc; /* Border Warm */
+  border-radius: 8px; padding: 5px 11px;
+  font-size: 13px; font-weight: 500;
+  color: #4d4c48; /* Charcoal Warm */
+  font-family: inherit; cursor: pointer;
+  /* Ring shadow */
+  box-shadow: #faf9f5 0px 0px 0px 0px, #d1cfc5 0px 0px 0px 1px;
+  transition: box-shadow .12s, color .12s;
+}
+.new-chat-btn:hover {
+  color: #141413;
+  box-shadow: #faf9f5 0px 0px 0px 0px, #c96442 0px 0px 0px 1px;
+}
+.new-chat-btn:disabled { opacity: .45; cursor: default; }
+
+.topbar-spacer { width: 80px; flex-shrink: 0; } /* mirrors new-chat-btn width for centering */
+
 /* ── artifact title ── */
 .artifact-title {
   display: flex; align-items: center; gap: 6px;
@@ -410,6 +600,33 @@ function fillChip(text: string) {
   background: #e8e6dc; /* Warm Sand */
   border-radius: 6px; padding: 1px 7px;
   letter-spacing: 0.01em;
+}
+
+/* ── streaming badge ── */
+.artifact-generating {
+  display: inline-flex; align-items: center; gap: 4px;
+  font-size: 11px; font-weight: 500;
+  color: #c96442; /* Terracotta */
+  letter-spacing: 0.01em;
+}
+.gen-dot {
+  width: 5px; height: 5px; border-radius: 50%;
+  background: #c96442;
+  display: inline-block;
+  animation: bounce-dot 1.2s ease-in-out infinite;
+}
+.gen-dot:nth-child(2) { animation-delay: .18s; }
+.gen-dot:nth-child(3) { animation-delay: .36s; }
+
+/* blinking cursor at end of streamed content */
+.stream-cursor {
+  display: inline-block; width: 2px; height: 1.1em;
+  background: #c96442; margin-left: 2px; vertical-align: text-bottom;
+  animation: blink-cursor .85s step-end infinite;
+}
+@keyframes blink-cursor {
+  0%,100% { opacity: 1; }
+  50%      { opacity: 0; }
 }
 
 /* ── Tabs ── */
@@ -745,13 +962,21 @@ function fillChip(text: string) {
 }
 
 .user-bubble {
-  background: #141413; /* Near Black */
-  color: #faf9f5;      /* Ivory */
+  background: #faf9f5; /* Ivory */
+  color: #141413;      /* Near Black */
+  border: 1px solid #e8e6dc; /* Border Warm */
+  box-shadow: #faf9f5 0px 0px 0px 0px, #d1cfc5 0px 0px 0px 1px;
   border-radius: 18px 18px 4px 18px;
   padding: 10px 16px;
   font-size: 15px; font-weight: 400;
   line-height: 1.60; white-space: pre-wrap;
   max-width: 86%; letter-spacing: -0.01em;
+}
+.user-bubble :deep(p) {
+  margin: 0 0 8px;
+}
+.user-bubble :deep(p:last-child) {
+  margin-bottom: 0;
 }
 
 /* Assistant row */
@@ -777,7 +1002,62 @@ function fillChip(text: string) {
 .ai-text {
   font-size: 15px; line-height: 1.75;
   color: #141413; /* Near Black */
-  white-space: pre-wrap; letter-spacing: -0.008em;
+  letter-spacing: -0.008em;
+}
+.ai-text :deep(p) {
+  margin: 0 0 8px;
+}
+.ai-text :deep(p:last-child) {
+  margin-bottom: 0;
+}
+.ai-text :deep(ul),
+.ai-text :deep(ol) {
+  margin: 4px 0 8px 18px;
+  padding: 0;
+}
+.ai-text :deep(li) {
+  margin: 0 0 4px;
+}
+.ai-text :deep(code) {
+  font-family: "SF Mono","Fira Code",monospace;
+  font-size: 12px;
+  background: #f0eee6;
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+.ai-text :deep(br) {
+  line-height: 1.75;
+}
+
+/* ── Retract button ── */
+.retract-btn {
+  display: flex; align-items: center; gap: 4px;
+  background: none; border: none;
+  font-size: 11.5px; font-weight: 500;
+  color: #87867f; /* Stone Gray */
+  font-family: inherit; cursor: pointer;
+  padding: 3px 6px; border-radius: 6px;
+  align-self: flex-end; margin-right: 4px; margin-bottom: 2px;
+  opacity: 0; transition: opacity .15s, color .12s;
+}
+.user-row:hover .retract-btn { opacity: 1; }
+.retract-btn:hover { color: #c96442; }
+
+/* ── Thinking indicator ── */
+.thinking-indicator {
+  display: flex; align-items: center; gap: 8px;
+  padding: 4px 0;
+}
+.thinking-orb {
+  width: 18px; height: 18px; border-radius: 50%;
+  border: 2px solid #e8e6dc; /* Warm Sand */
+  border-top-color: #c96442; /* Terracotta */
+  animation: rot .9s linear infinite;
+  flex-shrink: 0;
+}
+.thinking-label {
+  font-size: 14px; color: #87867f; /* Stone Gray */
+  letter-spacing: -0.005em;
 }
 
 /* ── Typing indicator ── */

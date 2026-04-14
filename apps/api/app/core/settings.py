@@ -1,4 +1,5 @@
 from functools import lru_cache
+import os
 from pathlib import Path
 
 from pydantic import Field
@@ -33,6 +34,12 @@ class Settings(BaseSettings):
     deepseek_base_url: str = Field(default="https://api.deepseek.com", alias="DEEPSEEK_BASE_URL")
     default_review_threshold: float = Field(default=8.0, alias="DEFAULT_REVIEW_THRESHOLD")
     max_auto_optimization_loops: int = Field(default=2, alias="MAX_AUTO_OPTIMIZATION_LOOPS")
+    langsmith_tracing: bool = Field(default=False, alias="LANGSMITH_TRACING")
+    langsmith_api_key: str | None = Field(default=None, alias="LANGSMITH_API_KEY")
+    langsmith_project: str = Field(default="course-agent", alias="LANGSMITH_PROJECT")
+    langsmith_endpoint: str = Field(default="https://api.smith.langchain.com", alias="LANGSMITH_ENDPOINT")
+    langchain_callbacks_background: bool = Field(default=False, alias="LANGCHAIN_CALLBACKS_BACKGROUND")
+    decision_model_data_dir: Path = Field(default=ROOT_DIR / "data" / "decision_model", alias="DECISION_MODEL_DATA_DIR")
 
 
 @lru_cache
@@ -41,4 +48,11 @@ def get_settings() -> Settings:
     settings.storage_dir.mkdir(parents=True, exist_ok=True)
     settings.deepseek_config_file.parent.mkdir(parents=True, exist_ok=True)
     settings.prompt_root_dir.mkdir(parents=True, exist_ok=True)
+    settings.decision_model_data_dir.mkdir(parents=True, exist_ok=True)
+    os.environ["LANGSMITH_TRACING"] = "true" if settings.langsmith_tracing else "false"
+    os.environ["LANGSMITH_PROJECT"] = settings.langsmith_project
+    os.environ["LANGSMITH_ENDPOINT"] = settings.langsmith_endpoint
+    os.environ["LANGCHAIN_CALLBACKS_BACKGROUND"] = "true" if settings.langchain_callbacks_background else "false"
+    if settings.langsmith_api_key:
+        os.environ["LANGSMITH_API_KEY"] = settings.langsmith_api_key
     return settings

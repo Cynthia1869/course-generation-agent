@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 
 from app.audit.logger import AuditService, EventBroker
 from app.core.settings import Settings
-from app.core.schemas import AuditEvent, MessageRecord, MessageRole, ReviewSubmitRequest, ThreadStatus
+from app.core.schemas import AuditEvent, DecisionTrainingRecord, MessageRecord, MessageRole, ReviewSubmitRequest, ThreadStatus
 from app.files.parser import DocumentParser
 from app.storage.thread_store import ThreadStore
 from app.workflows.course_graph import CourseGraph
@@ -51,6 +52,7 @@ class CourseAgentService:
 
     async def create_thread(self, user_id: str = "default-user"):
         state = await self.store.create_thread(user_id=user_id)
+        state.run_metadata.setdefault("decision_feedback_records", [])
         await self.audit.record(
             AuditEvent(
                 thread_id=state.thread_id,
@@ -120,10 +122,97 @@ class CourseAgentService:
             },
         )
 
+    async def retract_last_message(self, thread_id: str) -> None:
+        """Remove the last user message (only when thread is in COLLECTING state)."""
+        state = await self.store.get_thread(thread_id)
+        if not state.messages:
+            return
+        if state.messages[-1].role != MessageRole.USER:
+            return
+        if state.status not in (ThreadStatus.COLLECTING,):
+            return  # don't retract while generating / reviewing
+        state.messages.pop()
+        # also remove the preceding assistant clarification if present
+        if state.messages and state.messages[-1].role == MessageRole.ASSISTANT:
+            state.messages.pop()
+        await self.store.save_thread(state)
+        await self.broker.publish(
+            thread_id,
+            {"type": "message_retracted", "thread_id": thread_id, "payload": {}},
+        )
+
+    async def pause_thread(self, thread_id: str) -> None:
+        state = await self.store.get_thread(thread_id)
+        state.run_metadata["status_before_pause"] = state.status.value
+        state.status = ThreadStatus.PAUSED
+        await self.store.save_thread(state)
+        await self.audit.record(
+            AuditEvent(
+                thread_id=thread_id,
+                user_id=state.user_id,
+                event_type="THREAD_PAUSED",
+                payload_summary={"status_before_pause": state.run_metadata.get("status_before_pause")},
+            )
+        )
+
+    async def resume_paused_thread(self, thread_id: str) -> None:
+        state = await self.store.get_thread(thread_id)
+        previous = state.run_metadata.get("status_before_pause", ThreadStatus.COLLECTING.value)
+        state.status = ThreadStatus(previous)
+        await self.store.save_thread(state)
+        await self.audit.record(
+            AuditEvent(
+                thread_id=thread_id,
+                user_id=state.user_id,
+                event_type="THREAD_RESUMED",
+                payload_summary={"restored_status": previous},
+            )
+        )
+
+    async def get_history(self, thread_id: str):
+        return self.graph.get_state_history(thread_id)
+
+    async def export_decision_records(self, thread_id: str | None = None) -> list[dict]:
+        if thread_id:
+            state = await self.store.get_thread(thread_id)
+            return state.run_metadata.get("decision_feedback_records", [])
+
+        all_records: list[dict] = []
+        for state in self.store._threads.values():  # noqa: SLF001
+            all_records.extend(state.run_metadata.get("decision_feedback_records", []))
+        return all_records
+
     async def submit_review(self, thread_id: str, batch_id: str, review_request: ReviewSubmitRequest) -> None:
         state = await self.store.get_thread(thread_id)
         state.approved_feedback = review_request.review_actions
         state.status = ThreadStatus.REVISING
+        latest_batch = state.review_batches[-1] if state.review_batches else None
+        suggestions_by_id = {
+            suggestion.suggestion_id: suggestion
+            for suggestion in (latest_batch.suggestions if latest_batch else [])
+        }
+        training_records = state.run_metadata.setdefault("decision_feedback_records", [])
+        conversation_context = "\n".join(message.content for message in state.messages[-6:] if message.role == MessageRole.USER)
+        draft_excerpt = (state.draft_artifact.markdown[:1500] if state.draft_artifact else "")
+        for action in review_request.review_actions:
+            suggestion = suggestions_by_id.get(action.suggestion_id)
+            if not suggestion:
+                continue
+            record = DecisionTrainingRecord(
+                thread_id=thread_id,
+                suggestion_id=action.suggestion_id,
+                criterion_id=suggestion.criterion_id,
+                user_message_context=conversation_context,
+                decision_summary=state.decision_summary,
+                draft_excerpt=draft_excerpt,
+                model_problem=suggestion.problem,
+                model_suggestion=suggestion.suggestion,
+                human_action=action.action.value,
+                edited_suggestion=action.edited_suggestion,
+                reviewer_id=action.reviewer_id,
+            ).model_dump(mode="json")
+            training_records.append(record)
+            self._append_decision_record(record)
         await self.store.save_thread(state)
         await self.audit.record(
             AuditEvent(
@@ -145,3 +234,8 @@ class CourseAgentService:
             await self.graph.resume_thread(thread_id, resume_value)
         else:
             self._spawn(self.graph.resume_thread(thread_id, resume_value))
+
+    def _append_decision_record(self, record: dict) -> None:
+        output_path = self.settings.decision_model_data_dir / "decision_records.jsonl"
+        with output_path.open("a", encoding="utf-8") as file:
+            file.write(json.dumps(record, ensure_ascii=False) + "\n")

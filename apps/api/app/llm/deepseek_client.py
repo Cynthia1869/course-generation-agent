@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from textwrap import dedent
 from typing import AsyncIterator
 
+import httpx
 import yaml
 from langchain_openai import ChatOpenAI
+from pydantic import BaseModel
 
 from app.core.prompt_registry import PromptRegistry
 from app.core.settings import Settings
@@ -17,6 +20,16 @@ class DeepSeekProfile:
     review_model: str
     chat_temperature: float
     review_temperature: float
+
+
+class RequirementExtractionResult(BaseModel):
+    subject: str | None = None
+    grade_level: str | None = None
+    topic: str | None = None
+    audience: str | None = None
+    objective: str | None = None
+    duration: str | None = None
+    constraints: str | None = None
 
 
 class DeepSeekClient:
@@ -35,14 +48,19 @@ class DeepSeekClient:
         )
 
     def can_use_remote_llm(self) -> bool:
+        if self.settings.app_env == "test":
+            return False
         return bool(self.settings.deepseek_api_key)
 
     def _build_chat_model(self, *, model: str, temperature: float) -> ChatOpenAI:
+        # trust_env=False prevents httpx from picking up SOCKS/HTTP proxy env vars
         return ChatOpenAI(
             model=model,
             temperature=temperature,
             api_key=self.settings.deepseek_api_key,
             base_url=self.settings.deepseek_base_url,
+            http_client=httpx.Client(trust_env=False),
+            http_async_client=httpx.AsyncClient(trust_env=False),
         )
 
     async def stream_markdown(self, context: dict) -> AsyncIterator[str]:
@@ -85,6 +103,79 @@ class DeepSeekClient:
         )
         response = await model.ainvoke(prompt)
         return response.content if isinstance(response.content, str) else str(response.content)
+
+    async def stream_clarification(self, context: dict) -> AsyncIterator[str]:
+        if not self.can_use_remote_llm():
+            prompts = [f"{item['label']}：{item['prompt_hint']}" for item in context["missing_requirements"]]
+            text = "为了继续制课，我还需要你补充这些信息：\n" + "\n".join(f"- {line}" for line in prompts)
+            for chunk in self._split_chunks(text, chunk_size=24):
+                yield chunk
+            return
+
+        model = self._build_chat_model(
+            model=self.profile.chat_model,
+            temperature=0.2,
+        )
+        prompt = self.prompts.render(
+            "deepseek/clarify_requirements.md",
+            slot_summary=context["slot_summary"],
+            missing_requirements="\n".join(
+                f"- {item['label']}：{item['prompt_hint']}" for item in context["missing_requirements"]
+            ),
+        )
+        async for chunk in model.astream(prompt):
+            text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+            if text:
+                yield text
+
+    async def extract_requirements(
+        self,
+        *,
+        latest_user_message: str,
+        known_requirements: dict[str, str | None],
+        requirement_defs: list[dict],
+    ) -> dict[str, str | None]:
+        if not latest_user_message.strip():
+            return {}
+        if not self.can_use_remote_llm():
+            return self._fallback_extract_requirements(latest_user_message)
+
+        model = self._build_chat_model(
+            model=self.profile.chat_model,
+            temperature=0.0,
+        )
+        prompt = self.prompts.render(
+            "deepseek/extract_requirements.md",
+            requirement_defs="\n".join(f"- {item['slot_id']}: {item['label']}，{item['prompt_hint']}" for item in requirement_defs),
+            known_requirements="\n".join(f"- {key}: {value}" for key, value in known_requirements.items()) or "无",
+            latest_user_message=latest_user_message,
+        )
+        structured = model.with_structured_output(RequirementExtractionResult)
+        result = await structured.ainvoke(prompt)
+        payload = result.model_dump()
+        return {key: value for key, value in payload.items() if value}
+
+    def _fallback_extract_requirements(self, latest_user_message: str) -> dict[str, str | None]:
+        text = latest_user_message.strip()
+        extracted: dict[str, str | None] = {}
+
+        subject_match = re.search(r"(数学|物理|英语|语文|化学|生物|历史|地理)", text)
+        if subject_match:
+            extracted["subject"] = subject_match.group(1)
+
+        grade_match = re.search(r"(初一|初二|初三|高一|高二|高三|七年级|八年级|九年级)", text)
+        if grade_match:
+            extracted["grade_level"] = grade_match.group(1)
+
+        audience_match = re.search(r"(初中生|高中生|小学生|零基础学员)", text)
+        if audience_match:
+            extracted["audience"] = audience_match.group(1)
+
+        topic_match = re.search(r"(三角函数|一次函数|二次函数|几何证明|勾股定理|圆|概率|统计)", text)
+        if topic_match:
+            extracted["topic"] = topic_match.group(1)
+
+        return extracted
 
     async def review_markdown(self, *, markdown: str, rubric: list[dict], threshold: float) -> dict:
         if not self.can_use_remote_llm():
@@ -129,13 +220,13 @@ class DeepSeekClient:
 
     def _fallback_markdown(self, context: dict) -> str:
         topic = context["slots"].get("topic", "待补充主题")
-        audience = context["slots"].get("audience", "企业学员")
+        audience = context["slots"].get("audience", "目标学员")
         objective = context["slots"].get("objective", "完成本节课目标")
         return dedent(
             f"""
             # 单课框架
 
-            本节课解决的核心问题：围绕“{topic}”，帮助{audience}在真实业务场景中达成“{objective}”。
+            本节课解决的核心问题：围绕“{topic}”，帮助{audience}达成“{objective}”。
 
             ## 你将学会
 

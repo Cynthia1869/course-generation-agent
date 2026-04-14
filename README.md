@@ -23,6 +23,11 @@ cp .env.example .env
 # 把真实 key 放到 .env.local，不要提交到 Git
 # DEEPSEEK_API_KEY=你的key
 uvicorn app.main:app --app-dir apps/api --reload
+
+unset ALL_PROXY HTTP_PROXY HTTPS_PROXY all_proxy http_proxy https_proxy
+uvicorn app.main:app --app-dir apps/api --reload
+
+
 ```
 
 ```bash

@@ -1,10 +1,12 @@
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
-from app.api.deps import get_service
+from app.api.deps import get_decision_model_service, get_service
 from app.core.schemas import ApiEnvelope, ReviewSubmitRequest
 from app.services.course_agent import CourseAgentService
+from app.services.decision_model import DecisionModelService
+from app.storage.thread_store import ThreadNotFoundError
 
 
 router = APIRouter()
@@ -16,7 +18,13 @@ def envelope(*, data: dict, thread_id: str | None = None, request_id: str | None
 
 @router.get("/threads/{thread_id}/review-batches/{batch_id}")
 async def get_review_batch(thread_id: str, batch_id: str, service: CourseAgentService = Depends(get_service)):
-    batch = await service.store.get_review_batch(thread_id, batch_id)
+    try:
+        batch = await service.store.get_review_batch(thread_id, batch_id)
+    except ThreadNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "thread_not_found", "message": f"Thread not found: {exc.thread_id}"},
+        ) from exc
     return envelope(thread_id=thread_id, data={"review_batch": batch.model_dump(mode="json")})
 
 
@@ -27,5 +35,34 @@ async def submit_review(
     request: ReviewSubmitRequest,
     service: CourseAgentService = Depends(get_service),
 ):
-    await service.submit_review(thread_id, batch_id, request)
+    try:
+        await service.submit_review(thread_id, batch_id, request)
+    except ThreadNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "thread_not_found", "message": f"Thread not found: {exc.thread_id}"},
+        ) from exc
     return envelope(thread_id=thread_id, data={"submitted": True, "review_batch_id": batch_id})
+
+
+@router.get("/decision-records")
+async def list_decision_records(service: CourseAgentService = Depends(get_service)):
+    records = await service.export_decision_records()
+    return envelope(data={"records": records})
+
+
+@router.get("/threads/{thread_id}/decision-records")
+async def list_thread_decision_records(thread_id: str, service: CourseAgentService = Depends(get_service)):
+    try:
+        records = await service.export_decision_records(thread_id=thread_id)
+    except ThreadNotFoundError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail={"code": "thread_not_found", "message": f"Thread not found: {exc.thread_id}"},
+        ) from exc
+    return envelope(thread_id=thread_id, data={"records": records})
+
+
+@router.get("/decision-model/status")
+async def decision_model_status(decision_model_service: DecisionModelService = Depends(get_decision_model_service)):
+    return envelope(data={"status": decision_model_service.status()})

@@ -23,6 +23,7 @@ from app.core.schemas import (
     ReviewSuggestion,
     ThreadState,
     ThreadStatus,
+    ThreadHistoryEntry,
     VersionRecord,
 )
 from app.core.settings import Settings
@@ -33,16 +34,28 @@ from app.storage.thread_store import ThreadStore
 
 REQUIREMENT_DEFS = [
     {
+        "slot_id": "subject",
+        "label": "学科",
+        "prompt_hint": "这门课属于哪个学科，比如数学、物理、英语。",
+        "patterns": [r"(数学|物理|英语|语文|化学|生物|历史|地理)"],
+    },
+    {
+        "slot_id": "grade_level",
+        "label": "年级",
+        "prompt_hint": "面向哪个年级，比如初一、初二、初三、高一。",
+        "patterns": [r"(初一|初二|初三|高一|高二|高三|七年级|八年级|九年级)"],
+    },
+    {
         "slot_id": "topic",
-        "label": "课程主题",
-        "prompt_hint": "这节课具体教什么，比如提示词写作、海报设计、数据分析。",
-        "patterns": [r"主题是([^，。,]+)", r"课题是([^，。,]+)", r"课程主题是([^，。,]+)"],
+        "label": "知识点主题",
+        "prompt_hint": "这节课具体讲哪个知识点，比如三角函数、一次函数、几何证明。",
+        "patterns": [r"主题是([^，。,]+)", r"课题是([^，。,]+)", r"课程主题是([^，。,]+)", r"就是([^，。,]+)啊"],
     },
     {
         "slot_id": "audience",
         "label": "目标学员",
-        "prompt_hint": "这门课是给谁学的，比如运营、新媒体、小白用户、设计师。",
-        "patterns": [r"学员是([^，。,]+)", r"对象是([^，。,]+)", r"人群是([^，。,]+)"],
+        "prompt_hint": "这门课主要给谁学，比如初中生、高中生、零基础学员。",
+        "patterns": [r"学员是([^，。,]+)", r"对象是([^，。,]+)", r"人群是([^，。,]+)", r"(初中生|高中生|小学生|零基础学员)"],
     },
     {
         "slot_id": "objective",
@@ -64,6 +77,11 @@ REQUIREMENT_DEFS = [
     },
 ]
 
+CONFIRMATION_PATTERNS = [
+    r"^(开始生成|开始吧|可以生成|生成吧|就按这个来|没问题|可以|行|好的|确认|开始)$",
+    r"(开始生成|可以生成|就按这个来|确认开始)",
+]
+
 
 @dataclass
 class CourseGraph:
@@ -82,6 +100,7 @@ class CourseGraph:
         graph.add_node("intake_message", self.intake_message)
         graph.add_node("requirement_gap_check", self.requirement_gap_check)
         graph.add_node("clarify_question", self.clarify_question)
+        graph.add_node("confirm_requirements", self.confirm_requirements)
         graph.add_node("decision_update", self.decision_update)
         graph.add_node("source_parse", self.source_parse)
         graph.add_node("outline_generate", self.outline_generate)
@@ -99,9 +118,14 @@ class CourseGraph:
         graph.add_conditional_edges(
             "requirement_gap_check",
             self.route_after_gap_check,
-            {"clarify_question": "clarify_question", "decision_update": "decision_update"},
+            {
+                "clarify_question": "clarify_question",
+                "confirm_requirements": "confirm_requirements",
+                "decision_update": "decision_update",
+            },
         )
         graph.add_edge("clarify_question", END)
+        graph.add_edge("confirm_requirements", END)
         graph.add_edge("decision_update", "source_parse")
         graph.add_edge("source_parse", "outline_generate")
         graph.add_edge("outline_generate", "case_design_generate")
@@ -132,6 +156,20 @@ class CourseGraph:
     async def resume_thread(self, thread_id: str, resume_value: dict[str, Any]) -> None:
         config = {"configurable": {"thread_id": thread_id}}
         await self.graph.ainvoke(Command(resume=resume_value), config=config)
+
+    def get_state_history(self, thread_id: str) -> list[ThreadHistoryEntry]:
+        config = {"configurable": {"thread_id": thread_id}}
+        history: list[ThreadHistoryEntry] = []
+        for snapshot in self.graph.get_state_history(config):
+            history.append(
+                ThreadHistoryEntry(
+                    checkpoint_id=snapshot.config.get("configurable", {}).get("checkpoint_id"),
+                    next_nodes=list(snapshot.next) if snapshot.next else [],
+                    metadata=snapshot.metadata or {},
+                    values=snapshot.values or {},
+                )
+            )
+        return history
 
     async def _load_state(self, raw_state: dict[str, Any]) -> ThreadState:
         if raw_state.get("state"):
@@ -166,9 +204,21 @@ class CourseGraph:
 
     async def requirement_gap_check(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
-        content = "\n".join(message.content for message in state.messages if message.role == MessageRole.USER)
+        user_messages = [message.content for message in state.messages if message.role == MessageRole.USER]
+        content = "\n".join(user_messages)
+        latest_user_message = user_messages[-1] if user_messages else ""
         summary_parts = []
         missing_requirements = []
+        current_values = {
+            slot_id: slot.value
+            for slot_id, slot in state.requirement_slots.items()
+            if slot.value
+        }
+        extracted = await self.deepseek.extract_requirements(
+            latest_user_message=latest_user_message,
+            known_requirements=current_values,
+            requirement_defs=REQUIREMENT_DEFS,
+        )
         for requirement in REQUIREMENT_DEFS:
             slot = state.requirement_slots.get(requirement["slot_id"]) or RequirementSlot(
                 slot_id=requirement["slot_id"],
@@ -176,8 +226,14 @@ class CourseGraph:
                 prompt_hint=requirement["prompt_hint"],
             )
             if not slot.value:
+                llm_value = extracted.get(requirement["slot_id"])
+                if llm_value:
+                    slot.value = llm_value.strip()
+                    slot.confidence = 0.92
                 for pattern in requirement["patterns"]:
-                    match = re.search(pattern, content)
+                    if slot.value:
+                        break
+                    match = re.search(pattern, latest_user_message or content)
                     if match:
                         slot.value = match.group(1).strip()
                         slot.confidence = 0.85
@@ -196,6 +252,10 @@ class CourseGraph:
             state.requirement_slots[requirement["slot_id"]] = slot
         state.run_metadata["missing_requirements"] = missing_requirements
         state.run_metadata["slot_summary"] = "\n".join(summary_parts) or "暂无"
+        state.run_metadata["latest_user_message"] = latest_user_message
+        state.run_metadata["is_confirmation_reply"] = bool(
+            latest_user_message and any(re.search(pattern, latest_user_message.strip()) for pattern in CONFIRMATION_PATTERNS)
+        )
         return await self._save_state(
             state,
             "requirement_gap_check",
@@ -205,21 +265,31 @@ class CourseGraph:
 
     def route_after_gap_check(self, raw_state: dict[str, Any]) -> str:
         state = ThreadState.model_validate(raw_state["state"])
-        return "clarify_question" if state.run_metadata.get("missing_requirements") else "decision_update"
+        if state.run_metadata.get("missing_requirements"):
+            return "clarify_question"
+        if state.requirements_confirmed or state.run_metadata.get("is_confirmation_reply"):
+            return "decision_update"
+        return "confirm_requirements"
 
     async def clarify_question(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
-        question = await self.deepseek.ask_clarification(
+        question = ""
+        async for chunk in self.deepseek.stream_clarification(
             {
                 "slot_summary": state.run_metadata.get("slot_summary", "暂无"),
                 "missing_requirements": state.run_metadata.get("missing_requirements", []),
             }
-        )
+        ):
+            question += chunk
+            await self.broker.publish(
+                state.thread_id,
+                {"type": "assistant_token", "thread_id": state.thread_id, "payload": {"content": chunk}},
+            )
         state.messages.append(MessageRecord(role=MessageRole.ASSISTANT, content=question))
         state.status = ThreadStatus.COLLECTING
         await self.broker.publish(
             state.thread_id,
-            {"type": "assistant_message", "thread_id": state.thread_id, "payload": {"content": question}},
+            {"type": "assistant_stream_end", "thread_id": state.thread_id, "payload": {"content": question}},
         )
         return await self._save_state(
             state,
@@ -228,8 +298,31 @@ class CourseGraph:
             {"question": question[:160]},
         )
 
+    async def confirm_requirements(self, raw_state: dict[str, Any]) -> dict[str, Any]:
+        state = await self._load_state(raw_state)
+        summary = state.run_metadata.get("slot_summary", "暂无")
+        confirmation_message = (
+            "我先帮你把当前需求整理一下：\n\n"
+            f"{summary}\n\n"
+            "如果这些方向没问题，你直接回复“开始生成”就行；"
+            "如果有需要改的地方，直接告诉我改哪一项，我会继续和你一起调整。"
+        )
+        state.messages.append(MessageRecord(role=MessageRole.ASSISTANT, content=confirmation_message))
+        state.status = ThreadStatus.COLLECTING
+        await self.broker.publish(
+            state.thread_id,
+            {"type": "assistant_message", "thread_id": state.thread_id, "payload": {"content": confirmation_message}},
+        )
+        return await self._save_state(
+            state,
+            "confirm_requirements",
+            "REQUIREMENTS_READY_FOR_CONFIRMATION",
+            {"summary": summary[:200]},
+        )
+
     async def decision_update(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
+        state.requirements_confirmed = True
         for slot in state.requirement_slots.values():
             if slot.value and slot.confirmed:
                 if not any(item.topic == slot.slot_id and item.value == slot.value for item in state.decision_ledger):

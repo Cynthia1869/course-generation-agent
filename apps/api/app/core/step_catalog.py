@@ -66,6 +66,13 @@ SLOT_DEFINITIONS: dict[str, SlotDefinition] = {
     "script_requirements": SlotDefinition("script_requirements", "逐字稿要求", "逐字稿有什么特殊要求，比如口语化、节奏快、强调互动。", (r"逐字稿(?:要求)?是([^。；;\n]+)",)),
     "resource_requirements": SlotDefinition("resource_requirements", "资源需求", "素材清单里需要哪些资源，比如讲义、练习、演示文件、讲师提示。", (r"素材(?:清单)?(?:要求|范围)?是([^。；;\n]+)",)),
     "configuration_requirements": SlotDefinition("configuration_requirements", "配置需求", "素材包或配置上需要提前准备什么环境、账号、工具、参数。", (r"配置(?:要求|需求)?是([^。；;\n]+)",)),
+    "course_type": SlotDefinition("course_type", "课程主题类型", "这套系列课更接近技能实操、方法认知还是职业转型。"),
+    "target_user": SlotDefinition("target_user", "目标学员", "这套系列课主要面向哪类人，最好写清经验水平和当前卡点。"),
+    "learning_goal": SlotDefinition("learning_goal", "学习目标", "学完整个系列课后，用户最想拿到的结果是什么。"),
+    "mindset_shift": SlotDefinition("mindset_shift", "思维转换", "这套系列课要帮助用户完成的关键思维转变。"),
+    "course_size": SlotDefinition("course_size", "课程规模", "这套系列课希望做成几课的规模，轻量入门还是系统课。"),
+    "application": SlotDefinition("application", "应用场景", "这套系列课最终会在哪类真实场景中被用起来。"),
+    "supplementary_info": SlotDefinition("supplementary_info", "补充信息", "其他限制条件、禁区、特别要求或希望强调的点。"),
 }
 
 
@@ -73,8 +80,8 @@ SERIES_STEP = StepBlueprint(
     step_id="series_framework",
     label="系列课程框架",
     stage=WorkflowStage.CONTENT,
-    required_slots=("course_positioning", "topic", "audience", "target_problem", "expected_result"),
-    optional_slots=("tone_style", "duration", "constraints"),
+    required_slots=("course_type", "target_user", "learning_goal", "mindset_shift", "course_size", "application"),
+    optional_slots=("supplementary_info", "topic", "constraints"),
     forbidden_topics=("case_details", "script_content", "material_checklist"),
     artifact_filename="series_framework.md",
     generation_goal="生成系列课程框架",

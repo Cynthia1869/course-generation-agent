@@ -16,6 +16,7 @@ from app.api.deps import get_deepagents_service, get_service
 from app.core.schemas import ConfirmStepRequest, DraftArtifact, GenerationSessionState, ModeUpdateRequest, RegenerateRequest, ReviewBatch, ReviewSubmitRequest, ReviewCriterionResult, ThreadState, ThreadSummary
 from app.core.settings import get_settings
 from app.main import app
+from app.series.scoring import SeriesCriterion, SeriesReviewReport, SeriesSuggestion
 
 
 @pytest.fixture(autouse=True)
@@ -28,6 +29,24 @@ def isolate_test_state(tmp_path: Path):
     get_settings.cache_clear()
     get_service.cache_clear()
     get_deepagents_service.cache_clear()
+
+
+async def complete_series_guided_flow(service, thread_id: str):
+    messages = [
+        "A",
+        "我要做一套 AI 产品经理系列课，帮助产品经理把 AI 真正用进需求分析和 PRD 输出流程。",
+        "B",
+        "D 已经会写 PRD，但不会系统用 AI 提升需求分析效率的产品经理",
+        "B",
+        "D 从把 AI 当问答工具，转变为把 AI 当产品工作流助手",
+        "B",
+        "B",
+        "要求课程内容贴近日常产品工作，并且后半段一定要有真实案例。",
+        "开始生成",
+    ]
+    for content in messages:
+        await service.ingest_message(thread_id, content, "default-user")
+    return await service.store.get_thread(thread_id)
 
 
 @pytest.mark.asyncio
@@ -392,6 +411,7 @@ async def test_mode_switch_and_step_confirmation_persist_artifact(tmp_path: Path
     assert updated.course_mode.value == "series"
     assert updated.current_step_id == "series_framework"
     assert [step.step_id for step in updated.workflow_steps] == ["series_framework"]
+    assert "请选择使用方式" in updated.messages[-1].content
 
     state = await service.store.get_thread(thread.thread_id)
     state.draft_artifact = DraftArtifact(
@@ -403,15 +423,15 @@ async def test_mode_switch_and_step_confirmation_persist_artifact(tmp_path: Path
         ReviewBatch(
             step_id="series_framework",
             draft_version=1,
-            total_score=8.8,
-            threshold=8.0,
+            total_score=88.0,
+            threshold=80.0,
             criteria=[
                 ReviewCriterionResult(
                     criterion_id="core-problem",
                     name="核心问题",
                     weight=1.0,
-                    score=8.8,
-                    max_score=10,
+                    score=88.0,
+                    max_score=100,
                     reason="达标",
                 )
             ],
@@ -434,47 +454,30 @@ async def test_completion_gate_all_rejected_but_score_passes(monkeypatch: pytest
     get_service.cache_clear()
     service = get_service()
 
-    async def fake_review_markdown(**kwargs):
-        rubric = kwargs["rubric"]
-        step_label = kwargs.get("step_label", "当前步骤产物")
-        forbidden_topics = kwargs.get("forbidden_topics", "无")
-        assert step_label == "系列课程框架"
-        assert forbidden_topics
-        return {
-            "total_score": 8.8,
-            "criteria": [
-                {
-                    "criterion_id": item["criterion_id"],
-                    "name": item["name"],
-                    "weight": item["weight"],
-                    "score": 8.8,
-                    "max_score": item["max_score"],
-                    "reason": "整体达标。",
-                }
-                for item in rubric
+    async def fake_score_series_framework_markdown(markdown: str, deepseek):
+        return SeriesReviewReport(
+            total_score=88.0,
+            criteria=[
+                SeriesCriterion("目标清晰度", "目标清晰度", 12.0, 88.0, 100.0, "整体达标。"),
+                SeriesCriterion("内容逻辑性", "内容逻辑性", 18.0, 86.0, 100.0, "整体达标。"),
             ],
-            "suggestions": [
-                {
-                    "criterion_id": "case-design",
-                    "problem": "案例可以更贴近课堂。",
-                    "suggestion": "把示例替换成更贴近课堂的场景。",
-                    "evidence_span": "案例部分",
-                    "severity": "medium",
-                }
+            suggestions=[
+                SeriesSuggestion(
+                    criterion_id="内容逻辑性",
+                    problem="案例还可以更贴近真实工作场景。",
+                    suggestion="把后半段示例替换成更贴近日常产品协作的案例。",
+                    evidence_span="课程框架",
+                    severity="medium",
+                )
             ],
-        }
+            summary="达标。",
+        )
 
-    monkeypatch.setattr(service.graph.deepseek, "review_markdown", fake_review_markdown)
+    monkeypatch.setattr("app.workflows.course_graph.score_series_framework_markdown", fake_score_series_framework_markdown)
 
     thread = await service.create_thread()
     await service.update_mode(thread.thread_id, request=ModeUpdateRequest(mode="series"))
-    await service.ingest_message(
-        thread.thread_id,
-        "我要做一门入门课，给初中生，解决三角函数基础题不会做的问题，学完能独立完成基础题，风格实操带练，要求基于真实案例。",
-        "default-user",
-    )
-    await service.ingest_message(thread.thread_id, "开始生成", "default-user")
-    state = await service.store.get_thread(thread.thread_id)
+    state = await complete_series_guided_flow(service, thread.thread_id)
     batch = state.review_batches[-1]
 
     await service.submit_review(
@@ -502,53 +505,37 @@ async def test_interrupt_resume_survives_service_restart(monkeypatch: pytest.Mon
     get_service.cache_clear()
     service = get_service()
 
-    async def fake_review_markdown(**kwargs):
-        rubric = kwargs["rubric"]
-        step_label = kwargs.get("step_label", "当前步骤产物")
-        forbidden_topics = kwargs.get("forbidden_topics", "无")
-        assert step_label == "系列课程框架"
-        assert forbidden_topics
-        return {
-            "total_score": 8.5,
-            "criteria": [
-                {
-                    "criterion_id": item["criterion_id"],
-                    "name": item["name"],
-                    "weight": item["weight"],
-                    "score": 8.5,
-                    "max_score": item["max_score"],
-                    "reason": "整体达标。",
-                }
-                for item in rubric
+    async def fake_score_series_framework_markdown(markdown: str, deepseek):
+        return SeriesReviewReport(
+            total_score=85.0,
+            criteria=[
+                SeriesCriterion("目标清晰度", "目标清晰度", 12.0, 84.0, 100.0, "整体达标。"),
+                SeriesCriterion("实战性", "实战性", 14.0, 83.0, 100.0, "整体达标。"),
             ],
-            "suggestions": [
-                {
-                    "criterion_id": "script-quality",
-                    "problem": "逐字稿还能再自然一点。",
-                    "suggestion": "让结尾部分更口语化。",
-                    "evidence_span": "结尾",
-                    "severity": "low",
-                }
+            suggestions=[
+                SeriesSuggestion(
+                    criterion_id="实战性",
+                    problem="结尾还可以再加强收束感。",
+                    suggestion="让最后一课增加更完整的复盘和迁移说明。",
+                    evidence_span="课程框架",
+                    severity="low",
+                )
             ],
-        }
+            summary="达标。",
+        )
 
-    monkeypatch.setattr(service.graph.deepseek, "review_markdown", fake_review_markdown)
+    monkeypatch.setattr("app.workflows.course_graph.score_series_framework_markdown", fake_score_series_framework_markdown)
 
     thread = await service.create_thread()
     await service.update_mode(thread.thread_id, request=ModeUpdateRequest(mode="series"))
-    await service.ingest_message(
-        thread.thread_id,
-        "我要做一门入门课，给初中生，解决三角函数基础题不会做的问题，学完能独立完成基础题，风格实操带练，要求基于真实案例。",
-        "default-user",
-    )
-    await service.ingest_message(thread.thread_id, "开始生成", "default-user")
+    await complete_series_guided_flow(service, thread.thread_id)
 
     original_state = await service.store.get_thread(thread.thread_id)
     batch = original_state.review_batches[-1]
 
     get_service.cache_clear()
     restarted = get_service()
-    monkeypatch.setattr(restarted.graph.deepseek, "review_markdown", fake_review_markdown)
+    monkeypatch.setattr("app.workflows.course_graph.score_series_framework_markdown", fake_score_series_framework_markdown)
 
     await restarted.submit_review(
         thread.thread_id,
@@ -669,6 +656,94 @@ async def test_mode_specific_steps_are_distinct():
 
 
 @pytest.mark.asyncio
+async def test_series_mode_runs_guided_questionnaire_before_generation():
+    service = get_service()
+    thread = await service.create_thread()
+    await service.update_mode(thread.thread_id, ModeUpdateRequest(mode="series"))
+
+    state = await service.store.get_thread(thread.thread_id)
+    assert state.messages[-1].content.startswith("请选择使用方式")
+
+    await service.ingest_message(thread.thread_id, "A", "default-user")
+    state = await service.store.get_thread(thread.thread_id)
+    assert state.messages[-1].content.startswith("请输入你的制课想法")
+
+    await service.ingest_message(thread.thread_id, "我要做一套 AI 产品经理系列课。", "default-user")
+    state = await service.store.get_thread(thread.thread_id)
+    assert state.messages[-1].content.startswith("系列课结构化问答 1/7")
+
+    await service.ingest_message(thread.thread_id, "B", "default-user")
+    state = await service.store.get_thread(thread.thread_id)
+    assert state.runtime.series_guided.current_question_id == "target_user"
+
+
+@pytest.mark.asyncio
+async def test_series_guided_questionnaire_does_not_wait_for_remote_requirement_extraction(monkeypatch: pytest.MonkeyPatch):
+    service = get_service()
+    thread = await service.create_thread()
+    await service.update_mode(thread.thread_id, ModeUpdateRequest(mode="series"))
+
+    async def fail_if_called(**kwargs):
+        raise AssertionError("series guided questionnaire should not call remote requirement extraction")
+
+    monkeypatch.setattr(service.graph.deepseek, "extract_requirements", fail_if_called)
+
+    await service.ingest_message(thread.thread_id, "A", "default-user")
+    await service.ingest_message(thread.thread_id, "我要做一门 AI 编程入门系列课。", "default-user")
+
+    state = await service.store.get_thread(thread.thread_id)
+    assert state.runtime.series_guided.current_question_id == "course_type"
+    assert state.messages[-1].content.startswith("系列课结构化问答 1/7")
+
+
+@pytest.mark.asyncio
+async def test_series_framework_file_upload_runs_review_flow():
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post("/api/v1/threads")
+        thread_id = created.json()["data"]["thread"]["thread_id"]
+
+        updated = await client.patch(
+            f"/api/v1/threads/{thread_id}/mode",
+            json={"mode": "series", "user_id": "default-user"},
+        )
+        assert updated.status_code == 200
+
+        framework_markdown = """课程名称：AI 产品经理需求分析系列课
+目标学员：已经会写 PRD，但不会系统用 AI 提升需求分析效率的产品经理
+学员当前状态：会做基础需求分析，但没有把 AI 接进自己的产品工作流
+学员期望状态：可以把 AI 用进需求洞察、PRD 结构化和复盘优化流程
+思维转换：从把 AI 当问答工具，到把 AI 当产品工作流助手
+课程核心问题：如何让产品经理把 AI 真正用进需求分析与 PRD 输出流程
+课程应用场景：日常需求分析、方案拆解、PRD 产出和跨团队协作场景
+
+第1课：认识 AI 产品工作流
+内容：明确 AI 在需求分析流程中的角色定位和边界。
+
+第2课：用 AI 做需求洞察
+内容：围绕用户反馈、访谈纪要和数据线索完成问题整理。
+
+第3课：用 AI 提升 PRD 输出效率
+内容：把需求分析结果转成结构更完整、表达更清晰的 PRD 初稿。
+
+第4课：案例实战与复盘
+内容：围绕真实产品需求案例演练完整工作流并复盘优化。
+"""
+
+        uploaded = await client.post(
+            f"/api/v1/threads/{thread_id}/files?category=framework",
+            files={"file": ("series_framework.md", framework_markdown.encode("utf-8"), "text/markdown")},
+        )
+        assert uploaded.status_code == 200
+
+        thread = await client.get(f"/api/v1/threads/{thread_id}")
+        state = thread.json()["data"]["state"]
+        assert state["runtime"]["series_guided"]["using_existing_framework"] is True
+        assert state["runtime"]["series_guided"]["awaiting_framework_input"] is False
+        assert state["draft_artifact"] is not None
+        assert state["review_batches"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("mode", "expected_current_step", "expected_steps"),
     [
@@ -734,6 +809,8 @@ async def test_switching_mode_clears_stale_artifact_review_and_generation_contex
     assert updated.review_batches == []
     assert updated.runtime.generation_session is None
     assert updated.runtime.pending_manual_revision_request is None
+    assert updated.runtime.series_guided.awaiting_entry_mode is True
+    assert "请选择使用方式" in updated.messages[-1].content
 
 
 @pytest.mark.asyncio
@@ -781,48 +858,27 @@ async def test_confirm_gate_requires_explicit_start_generate_after_required_slot
 async def test_series_review_gate_keeps_series_framework_pending_after_generation(monkeypatch: pytest.MonkeyPatch):
     service = get_service()
 
-    async def fake_review_markdown(**kwargs):
-        rubric = kwargs["rubric"]
-        step_label = kwargs.get("step_label", "当前步骤产物")
-        forbidden_topics = kwargs.get("forbidden_topics", "无")
-        assert step_label == "系列课程框架"
-        assert forbidden_topics
-        return {
-            "total_score": 8.8,
-            "criteria": [
-                {
-                    "criterion_id": item["criterion_id"],
-                    "name": item["name"],
-                    "weight": item["weight"],
-                    "score": 8.8,
-                    "max_score": item["max_score"],
-                    "reason": "整体达标。",
-                }
-                for item in rubric
+    async def fake_score_series_framework_markdown(markdown: str, deepseek):
+        return SeriesReviewReport(
+            total_score=88.0,
+            criteria=[SeriesCriterion("目标清晰度", "目标清晰度", 12.0, 88.0, 100.0, "整体达标。")],
+            suggestions=[
+                SeriesSuggestion(
+                    criterion_id="内容逻辑性",
+                    problem="案例还可以更贴近课堂。",
+                    suggestion="把案例改成更贴近课堂的练习场景。",
+                    evidence_span="课程框架",
+                    severity="medium",
+                )
             ],
-            "suggestions": [
-                {
-                    "criterion_id": "case-design",
-                    "problem": "案例还可以更贴近课堂。",
-                    "suggestion": "把案例改成更贴近课堂的练习场景。",
-                    "evidence_span": "案例部分",
-                    "severity": "medium",
-                }
-            ],
-        }
+            summary="达标。",
+        )
 
-    monkeypatch.setattr(service.graph.deepseek, "review_markdown", fake_review_markdown)
+    monkeypatch.setattr("app.workflows.course_graph.score_series_framework_markdown", fake_score_series_framework_markdown)
 
     thread = await service.create_thread()
     await service.update_mode(thread.thread_id, ModeUpdateRequest(mode="series"))
-    await service.ingest_message(
-        thread.thread_id,
-        "我要做一门入门课，给初中生，主题是三角函数，解决基础题不会做的问题，学完能独立完成基础题，风格实操带练，要求基于真实案例。",
-        "default-user",
-    )
-    await service.ingest_message(thread.thread_id, "开始生成", "default-user")
-
-    state = await service.store.get_thread(thread.thread_id)
+    state = await complete_series_guided_flow(service, thread.thread_id)
     batch = state.review_batches[-1]
 
     assert state.status.value == "review_pending"
@@ -845,15 +901,15 @@ async def test_confirm_step_api_reports_review_gate_when_latest_review_score_is_
         ReviewBatch(
             step_id="series_framework",
             draft_version=1,
-            total_score=7.1,
-            threshold=8.0,
+            total_score=71.0,
+            threshold=80.0,
             criteria=[
                 ReviewCriterionResult(
                     criterion_id="core-problem",
                     name="核心问题",
                     weight=1.0,
-                    score=7.1,
-                    max_score=10,
+                    score=71.0,
+                    max_score=100,
                     reason="未达标",
                 )
             ],

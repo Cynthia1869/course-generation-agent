@@ -41,8 +41,10 @@ from app.core.schemas import (
 )
 from app.files.parser import DocumentParser
 from app.review.rubric import RUBRIC
+from app.series.decision_scoring import score_series_framework_markdown
 from app.storage.thread_store import ThreadStore
 from app.workflows.course_graph import CourseGraph
+from app.workflows.course_graph import SERIES_STARTER_PROMPT
 
 
 @dataclass
@@ -217,8 +219,12 @@ class ThreadUseCases:
         state.draft_artifact = None
         state.review_batches = []
         state.approved_feedback = []
+        state.runtime.series_guided = state.runtime.series_guided.__class__()
         state.runtime.generation_session = None
         state.runtime.pending_manual_revision_request = None
+        if request.mode == CourseMode.SERIES:
+            state.runtime.series_guided.awaiting_entry_mode = True
+            state.messages.append(MessageRecord(role=MessageRole.ASSISTANT, content=SERIES_STARTER_PROMPT))
         await self.support.store.save_thread(state)
         await self.support.record_timeline(thread_id, "mode_changed", "切换了制课模式", detail=request.mode.value)
         return state
@@ -385,7 +391,12 @@ class ArtifactUseCases:
         return artifact
 
     async def upload_file(self, thread_id: str, filename: str, mime_type: str, content: bytes, category: UploadCategory = UploadCategory.CONTEXT) -> None:
-        bucket_dir = "package_uploads" if category == UploadCategory.PACKAGE else "context_uploads"
+        if category == UploadCategory.PACKAGE:
+            bucket_dir = "package_uploads"
+        elif category == UploadCategory.FRAMEWORK:
+            bucket_dir = "framework_uploads"
+        else:
+            bucket_dir = "context_uploads"
         path = self.settings.storage_dir / thread_id / bucket_dir
         path.mkdir(parents=True, exist_ok=True)
         file_path = path / filename
@@ -394,6 +405,15 @@ class ArtifactUseCases:
         doc.metadata["category"] = category.value
         state = await self.support.store.get_thread(thread_id)
         state.source_manifest.append(doc)
+        if category == UploadCategory.FRAMEWORK and state.course_mode == CourseMode.SERIES:
+            framework_markdown = "\n".join(chunk.text for chunk in doc.text_chunks).strip()
+            state.runtime.series_guided.awaiting_entry_mode = False
+            state.runtime.series_guided.awaiting_framework_input = False
+            state.runtime.series_guided.using_existing_framework = True
+            state.runtime.series_guided.imported_framework_markdown = framework_markdown
+            state.runtime.series_guided.completed = True
+            state.runtime.series_guided.ready_to_generate = True
+            self.support.graph._hydrate_series_slots_from_framework(state, framework_markdown)
         state.saved_artifacts.append(
             SavedArtifactRecord(
                 step_id="package_upload" if category == UploadCategory.PACKAGE else state.current_step_id,
@@ -516,24 +536,51 @@ class ArtifactUseCases:
             version=artifact.version,
         )
         await self.support.store.upsert_artifact_version(thread_id, artifact)
-        review_result = await self.support.graph.deepseek.review_markdown(
-            prompt_id=step.review_prompt_id or "review.step_artifact",
-            markdown=artifact.markdown,
-            rubric=RUBRIC,
-            threshold=self.settings.default_review_threshold,
-            step_label=step.label,
-            step_scope=self.support.graph._step_scope(step),
-            allowed_input_layers="当前步骤结构化输入、已确认前序产物、上传资料摘要、当前步骤产物",
-            forbidden_input_layers="未来步骤内容、未确认产物、reasoning 内容、原始聊天消息",
-            forbidden_topics="、".join(step.forbidden_topics) or "无",
-        )
+        if step.step_id == "series_framework":
+            series_report = await score_series_framework_markdown(artifact.markdown, self.support.graph.deepseek)
+            review_result = {
+                "total_score": series_report.total_score,
+                "criteria": [
+                    {
+                        "criterion_id": item.criterion_id,
+                        "name": item.name,
+                        "weight": item.weight,
+                        "score": item.score,
+                        "max_score": item.max_score,
+                        "reason": item.reason,
+                    }
+                    for item in series_report.criteria
+                ],
+                "suggestions": [
+                    {
+                        "criterion_id": item.criterion_id,
+                        "problem": item.problem,
+                        "suggestion": item.suggestion,
+                        "evidence_span": item.evidence_span,
+                        "severity": item.severity,
+                    }
+                    for item in series_report.suggestions
+                ],
+            }
+        else:
+            review_result = await self.support.graph.deepseek.review_markdown(
+                prompt_id=step.review_prompt_id or "review.step_artifact",
+                markdown=artifact.markdown,
+                rubric=RUBRIC,
+                threshold=self.support.graph._review_threshold(step),
+                step_label=step.label,
+                step_scope=self.support.graph._step_scope(step),
+                allowed_input_layers="当前步骤结构化输入、已确认前序产物、上传资料摘要、当前步骤产物",
+                forbidden_input_layers="未来步骤内容、未确认产物、reasoning 内容、原始聊天消息",
+                forbidden_topics="、".join(step.forbidden_topics) or "无",
+            )
         batch = ReviewBatch(
             step_id=state.current_step_id,
             draft_version=artifact.version,
             total_score=float(review_result["total_score"]),
             criteria=[ReviewCriterionResult.model_validate(item) for item in review_result["criteria"]],
             suggestions=[ReviewSuggestion.model_validate(item) for item in review_result["suggestions"]],
-            threshold=self.settings.default_review_threshold,
+            threshold=self.support.graph._review_threshold(step),
         )
         state.review_batches.append(batch)
         self.support.sync_step_artifact_generated(

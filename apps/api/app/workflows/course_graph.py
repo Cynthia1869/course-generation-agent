@@ -16,6 +16,7 @@ from app.core.schemas import (
     ConstraintKind,
     ConfirmedArtifactContext,
     ConversationConstraint,
+    CourseMode,
     DecisionItem,
     DraftArtifact,
     GenerationRun,
@@ -48,6 +49,9 @@ from app.core.settings import Settings
 from app.core.step_catalog import SLOT_DEFINITIONS, StepBlueprint, get_slot_definition, get_step_blueprint
 from app.llm.deepseek_client import DeepSeekClient
 from app.review.rubric import RUBRIC
+from app.series.decision_scoring import score_series_framework_markdown
+from app.series.questionnaire import QUESTION_FLOW, get_question_by_step, parse_user_answer, render_question_prompt
+from app.series.scoring import parse_framework_markdown
 from app.storage.thread_store import ThreadStore
 
 
@@ -55,6 +59,12 @@ CONFIRMATION_PATTERNS = [
     r"^(开始生成|开始吧|可以生成|生成吧|就按这个来|没问题|可以|行|好的|确认|开始|继续下一步)$",
     r"(开始生成|可以生成|就按这个来|确认开始|继续下一步)",
 ]
+
+SERIES_STARTER_PROMPT = (
+    "请选择使用方式：\n"
+    "A. 我没有框架，直接开始制课\n"
+    "B. 我有现成的框架，直接评分并优化"
+)
 
 
 @dataclass
@@ -138,6 +148,7 @@ class CourseGraph:
         graph = StateGraph(dict)
         graph.add_node("intake_message", self.intake_message)
         graph.add_node("requirement_gap_check", self.requirement_gap_check)
+        graph.add_node("series_guided_question", self.series_guided_question)
         graph.add_node("clarify_question", self.clarify_question)
         graph.add_node("confirm_requirements", self.confirm_requirements)
         graph.add_node("decision_update", self.decision_update)
@@ -157,12 +168,14 @@ class CourseGraph:
             "requirement_gap_check",
             self.route_after_gap_check,
             {
+                "series_guided_question": "series_guided_question",
                 "clarify_question": "clarify_question",
                 "confirm_requirements": "confirm_requirements",
                 "decision_update": "decision_update",
                 "apply_manual_feedback": "apply_manual_feedback",
             },
         )
+        graph.add_edge("series_guided_question", END)
         graph.add_edge("clarify_question", END)
         graph.add_edge("confirm_requirements", END)
         graph.add_edge("decision_update", "source_parse")
@@ -478,6 +491,145 @@ class CourseGraph:
             record.latest_review_batch_id = review_batch_id
         record.updated_at = datetime.now(UTC)
 
+    def _review_threshold(self, step: StepBlueprint) -> float:
+        if step.step_id == "series_framework":
+            return 80.0
+        return self.settings.default_review_threshold
+
+    def _is_series_step(self, state: ThreadState, step: StepBlueprint | None = None) -> bool:
+        current = step or self._current_step(state)
+        return state.course_mode == CourseMode.SERIES and current.step_id == "series_framework"
+
+    def _sync_series_answer_slot(self, state: ThreadState, slot_id: str, value: str) -> None:
+        slot = state.requirement_slots.get(slot_id) or get_slot_definition(slot_id)
+        slot.value = value
+        slot.confidence = 1.0
+        slot.confirmed = True
+        state.requirement_slots[slot_id] = slot
+
+    def _infer_series_topic(self, user_input: str) -> str:
+        text = user_input.strip()
+        match = re.search(r"做(?:一套|一门)?(.+?)(?:系列课|课程)", text)
+        if match:
+            topic = match.group(1).strip("：:，,。 ")
+            if topic:
+                return topic
+        for marker in ("帮助", "面向", "让", "用于"):
+            if marker in text:
+                return text.split(marker, 1)[0].strip("：:，,。 ")
+        return text[:40] if text else "待补充主题"
+
+    def _hydrate_series_slots_from_framework(self, state: ThreadState, markdown_text: str) -> None:
+        framework = parse_framework_markdown(markdown_text)
+        lesson_count = len(framework.lessons)
+        course_size = f"标准系统课：{lesson_count} 课" if lesson_count else "待补充"
+        course_type = "方法认知型"
+        if any(token in framework.course_name + framework.core_problem for token in ("转型", "岗位", "职业")):
+            course_type = "职业转型型"
+        elif any(token in framework.course_name + framework.core_problem for token in ("实战", "案例", "项目", "工作流", "搭建")):
+            course_type = "技能实操型"
+        learning_goal = framework.learner_expected_state if framework.learner_expected_state != "待补充" else framework.core_problem
+        self._sync_series_answer_slot(state, "topic", framework.course_name)
+        self._sync_series_answer_slot(state, "course_type", course_type)
+        self._sync_series_answer_slot(state, "target_user", framework.target_user)
+        self._sync_series_answer_slot(state, "learning_goal", learning_goal)
+        self._sync_series_answer_slot(state, "mindset_shift", framework.mindset_shift)
+        self._sync_series_answer_slot(state, "course_size", course_size)
+        self._sync_series_answer_slot(state, "application", framework.application_scenario)
+
+    async def _handle_series_guided_requirement_gap(self, state: ThreadState, step: StepBlueprint, latest_user_message: str) -> dict[str, Any]:
+        guided = state.runtime.series_guided
+        raw_text = latest_user_message.strip()
+
+        if guided.ready_to_generate:
+            state.runtime.clarification.missing_requirements = self._missing_required_slots(state, step)
+            state.runtime.clarification.next_requirement_to_clarify = None
+            state.runtime.clarification.slot_summary = self._structured_inputs_text(self._build_structured_input(state, step))
+            state.runtime.clarification.latest_user_message = latest_user_message
+            state.runtime.clarification.is_confirmation_reply = True
+            return await self._save_state(state, "requirement_gap_check", "GRAPH_NODE_COMPLETED", {"step_id": step.step_id, "missing_requirements": [], "mode": "series_ready_to_generate"})
+
+        if guided.completed:
+            missing = self._missing_required_slots(state, step)
+            state.runtime.clarification.missing_requirements = missing
+            state.runtime.clarification.next_requirement_to_clarify = missing[0]["slot_id"] if missing else None
+            state.runtime.clarification.slot_summary = self._structured_inputs_text(self._build_structured_input(state, step))
+            state.runtime.clarification.latest_user_message = latest_user_message
+            state.runtime.clarification.is_confirmation_reply = bool(raw_text and any(re.search(pattern, raw_text) for pattern in CONFIRMATION_PATTERNS))
+            return await self._save_state(state, "requirement_gap_check", "GRAPH_NODE_COMPLETED", {"step_id": step.step_id, "missing_requirements": [item["slot_id"] for item in missing], "mode": "series_confirm"})
+
+        if guided.awaiting_entry_mode:
+            choice = raw_text.upper()
+            if choice == "A":
+                guided.entry_mode = "guided"
+                guided.awaiting_entry_mode = False
+                guided.awaiting_initial_idea = True
+                guided.current_question_prompt = "请输入你的制课想法，我会先帮你把主题收束，再进入系列课结构化问答。"
+            elif choice == "B":
+                guided.entry_mode = "framework"
+                guided.awaiting_entry_mode = False
+                guided.awaiting_framework_input = True
+                guided.current_question_prompt = "请粘贴你的课程框架，或直接上传框架文件；我会按系列课标准直接评分并给出优化建议。"
+            else:
+                guided.current_question_prompt = SERIES_STARTER_PROMPT + "\n\n请直接回复 A 或 B。"
+            return await self._save_state(state, "requirement_gap_check", "GRAPH_NODE_COMPLETED", {"step_id": step.step_id, "missing_requirements": [], "mode": "series_entry"})
+
+        if guided.awaiting_initial_idea:
+            guided.initial_user_input = raw_text
+            guided.awaiting_initial_idea = False
+            guided.next_question_index = 0
+            self._sync_series_answer_slot(state, "topic", self._infer_series_topic(raw_text))
+            question = QUESTION_FLOW[guided.next_question_index]
+            guided.current_question_id = question.step.value
+            guided.current_question_prompt = render_question_prompt(question, 1, len(QUESTION_FLOW))
+            return await self._save_state(state, "requirement_gap_check", "GRAPH_NODE_COMPLETED", {"step_id": step.step_id, "missing_requirements": [], "mode": "series_initial_idea"})
+
+        if guided.awaiting_framework_input:
+            if not raw_text:
+                guided.current_question_prompt = "请先粘贴你的课程框架，或上传框架文件后我再继续。"
+            else:
+                guided.awaiting_framework_input = False
+                guided.using_existing_framework = True
+                guided.imported_framework_markdown = latest_user_message.strip()
+                guided.completed = True
+                guided.ready_to_generate = True
+                self._hydrate_series_slots_from_framework(state, guided.imported_framework_markdown)
+            return await self._save_state(state, "requirement_gap_check", "GRAPH_NODE_COMPLETED", {"step_id": step.step_id, "missing_requirements": [], "mode": "series_framework_input"})
+
+        question = get_question_by_step(guided.current_question_id or "")
+        if question is None and guided.next_question_index < len(QUESTION_FLOW):
+            question = QUESTION_FLOW[guided.next_question_index]
+            guided.current_question_id = question.step.value
+        if question is None:
+            guided.completed = True
+            state.runtime.clarification.slot_summary = self._structured_inputs_text(self._build_structured_input(state, step))
+            return await self._save_state(state, "requirement_gap_check", "GRAPH_NODE_COMPLETED", {"step_id": step.step_id, "missing_requirements": [], "mode": "series_fallback_complete"})
+
+        try:
+            answer = parse_user_answer(question, latest_user_message)
+        except ValueError as exc:
+            guided.current_question_prompt = f"{exc}\n\n{render_question_prompt(question, guided.next_question_index + 1, len(QUESTION_FLOW))}"
+            return await self._save_state(state, "requirement_gap_check", "GRAPH_NODE_COMPLETED", {"step_id": step.step_id, "missing_requirements": [], "mode": "series_retry_question"})
+
+        guided.answers[answer.step.value] = answer
+        self._sync_series_answer_slot(state, answer.step.value, answer.final_answer)
+        guided.next_question_index += 1
+        if guided.next_question_index < len(QUESTION_FLOW):
+            next_question = QUESTION_FLOW[guided.next_question_index]
+            guided.current_question_id = next_question.step.value
+            guided.current_question_prompt = render_question_prompt(next_question, guided.next_question_index + 1, len(QUESTION_FLOW))
+        else:
+            guided.current_question_id = None
+            guided.current_question_prompt = None
+            guided.completed = True
+            guided.awaiting_confirmation = True
+            state.runtime.clarification.missing_requirements = []
+            state.runtime.clarification.next_requirement_to_clarify = None
+            state.runtime.clarification.slot_summary = self._structured_inputs_text(self._build_structured_input(state, step))
+            state.runtime.clarification.latest_user_message = latest_user_message
+            state.runtime.clarification.is_confirmation_reply = False
+        return await self._save_state(state, "requirement_gap_check", "GRAPH_NODE_COMPLETED", {"step_id": step.step_id, "missing_requirements": [], "mode": "series_questionnaire"})
+
     async def intake_message(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
         return await self._save_state(state, "intake_message", "GRAPH_NODE_ENTERED", {"message_count": len(state.messages), "step_id": state.current_step_id})
@@ -500,6 +652,9 @@ class CourseGraph:
                 model_config=self.deepseek.get_profile("extract"),
                 prompt_id="extract.requirements",
             )
+
+        if self._is_series_step(state, step):
+            return await self._handle_series_guided_requirement_gap(state, step, latest_user_message)
 
         current_values = {
             slot_id: slot.value
@@ -550,11 +705,27 @@ class CourseGraph:
         state = ThreadState.model_validate(raw_state["state"])
         if state.runtime.pending_manual_revision_request and state.draft_artifact is not None:
             return "apply_manual_feedback"
+        if state.course_mode == CourseMode.SERIES and state.runtime.series_guided.current_question_prompt and not state.runtime.series_guided.completed:
+            return "series_guided_question"
+        if state.course_mode == CourseMode.SERIES and state.runtime.series_guided.ready_to_generate:
+            return "decision_update"
         if state.runtime.clarification.missing_requirements:
             return "clarify_question"
         if state.runtime.clarification.is_confirmation_reply:
             return "decision_update"
         return "confirm_requirements"
+
+    async def series_guided_question(self, raw_state: dict[str, Any]) -> dict[str, Any]:
+        state = await self._load_state(raw_state)
+        prompt = state.runtime.series_guided.current_question_prompt
+        if not prompt:
+            return await self._save_state(state, "series_guided_question", "GRAPH_NODE_SKIPPED", {"reason": "no_series_prompt"})
+        state.messages.append(MessageRecord(role=MessageRole.ASSISTANT, content=prompt))
+        state.status = ThreadStatus.COLLECTING
+        state.runtime.series_guided.current_question_prompt = None
+        await self.broker.publish(state.thread_id, {"type": "assistant_message", "thread_id": state.thread_id, "payload": {"content": prompt}})
+        await self._timeline(state.thread_id, "series_guided_prompt", "系列课结构化问题已发出", detail=prompt[:160], payload={"step_id": state.current_step_id})
+        return await self._save_state(state, "series_guided_question", "SERIES_GUIDED_PROMPTED", {"step_id": state.current_step_id, "prompt": prompt[:160]})
 
     async def clarify_question(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
@@ -625,6 +796,8 @@ class CourseGraph:
                         state.conversation_constraints.append(ConversationConstraint(kind=ConstraintKind.REQUIRE, instruction=slot.value, normalized_instruction=normalized))
         state.decision_summary = "\n".join(f"{item.topic}: {item.value}" for item in state.decision_ledger)
         state.requirements_confirmed = True
+        if self._is_series_step(state, step):
+            state.runtime.series_guided.ready_to_generate = False
         await self._timeline(state.thread_id, "requirements_confirmed", f"{step.label}需求已确认", payload={"decision_count": len(state.decision_ledger), "step_id": step.step_id})
         return await self._save_state(state, "decision_update", "DECISION_CONFIRMED", {"decision_count": len(state.decision_ledger), "step_id": step.step_id})
 
@@ -637,6 +810,20 @@ class CourseGraph:
     async def generate_step_artifact(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
         step = self._current_step(state)
+        if self._is_series_step(state, step) and state.runtime.series_guided.using_existing_framework and state.runtime.series_guided.imported_framework_markdown:
+            markdown = state.runtime.series_guided.imported_framework_markdown.strip()
+            next_version = max([item.version for item in await self.store.list_versions(state.thread_id)], default=0) + 1
+            artifact = DraftArtifact(step_id=step.step_id, version=next_version, markdown=markdown, summary=f"{step.label}已导入。")
+            state.status = ThreadStatus.GENERATING
+            state.draft_artifact = artifact
+            state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, step_id=step.step_id))
+            await self.store.upsert_artifact_version(state.thread_id, artifact)
+            await self._persist_current_step_artifact(state)
+            self._sync_current_step_artifact_state(state)
+            await self.broker.publish(state.thread_id, {"type": "generation_completed", "thread_id": state.thread_id, "payload": {"version": artifact.version, "step_id": step.step_id, "source": "framework_import"}})
+            await self._timeline(state.thread_id, "generation_completed", f"{step.label}已导入", payload={"version": artifact.version, "step_id": step.step_id, "source": "framework_import"})
+            return await self._save_state(state, "generate_step_artifact", "DRAFT_GENERATED", {"artifact_version": artifact.version, "step_id": step.step_id, "source": "framework_import"})
+
         context_layers = await self._build_prompt_context_layers(state, step)
         session = self._start_generation_session(state, step=step, kind=GenerationRunKind.GENERATION, revision_goal=step.generation_goal)
         state.status = ThreadStatus.GENERATING
@@ -703,24 +890,52 @@ class CourseGraph:
         state = await self._load_state(raw_state)
         step = self._current_step(state)
         state.status = ThreadStatus.REVIEW_PENDING
-        result = await self.deepseek.review_markdown(
-            prompt_id=step.review_prompt_id or "review.step_artifact",
-            markdown=state.draft_artifact.markdown,
-            rubric=RUBRIC,
-            threshold=self.settings.default_review_threshold,
-            step_label=step.label,
-            step_scope=self._step_scope(step),
-            allowed_input_layers="当前步骤结构化输入、已确认前序产物、上传资料摘要、当前步骤产物",
-            forbidden_input_layers="未来步骤内容、未确认产物、reasoning 内容、原始聊天消息",
-            forbidden_topics="、".join(step.forbidden_topics) or "无",
-        )
+        threshold = self._review_threshold(step)
+        if self._is_series_step(state, step):
+            report = await score_series_framework_markdown(state.draft_artifact.markdown, self.deepseek)
+            result = {
+                "total_score": report.total_score,
+                "criteria": [
+                    {
+                        "criterion_id": item.criterion_id,
+                        "name": item.name,
+                        "weight": item.weight,
+                        "score": item.score,
+                        "max_score": item.max_score,
+                        "reason": item.reason,
+                    }
+                    for item in report.criteria
+                ],
+                "suggestions": [
+                    {
+                        "criterion_id": item.criterion_id,
+                        "problem": item.problem,
+                        "suggestion": item.suggestion,
+                        "evidence_span": item.evidence_span,
+                        "severity": item.severity,
+                    }
+                    for item in report.suggestions
+                ],
+            }
+        else:
+            result = await self.deepseek.review_markdown(
+                prompt_id=step.review_prompt_id or "review.step_artifact",
+                markdown=state.draft_artifact.markdown,
+                rubric=RUBRIC,
+                threshold=threshold,
+                step_label=step.label,
+                step_scope=self._step_scope(step),
+                allowed_input_layers="当前步骤结构化输入、已确认前序产物、上传资料摘要、当前步骤产物",
+                forbidden_input_layers="未来步骤内容、未确认产物、reasoning 内容、原始聊天消息",
+                forbidden_topics="、".join(step.forbidden_topics) or "无",
+            )
         batch = ReviewBatch(
             step_id=step.step_id,
             draft_version=state.draft_artifact.version,
             total_score=float(result["total_score"]),
             criteria=[ReviewCriterionResult.model_validate(item) for item in result["criteria"]],
             suggestions=[ReviewSuggestion.model_validate(item) for item in result["suggestions"]],
-            threshold=self.settings.default_review_threshold,
+            threshold=threshold,
         )
         state.review_batches.append(batch)
         self._session(state).review_batch_id = batch.review_batch_id
@@ -742,7 +957,7 @@ class CourseGraph:
         state = ThreadState.model_validate(raw_state["state"])
         latest_review = state.review_batches[-1]
         loops = state.runtime.generation_session.auto_optimization_loops if state.runtime.generation_session else 0
-        if latest_review.total_score < self.settings.default_review_threshold and loops < self.settings.max_auto_optimization_loops:
+        if latest_review.total_score < latest_review.threshold and loops < self.settings.max_auto_optimization_loops:
             return "auto_improve"
         return "human_review_interrupt"
 

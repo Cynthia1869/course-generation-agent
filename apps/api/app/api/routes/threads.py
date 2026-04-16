@@ -232,4 +232,9 @@ async def regenerate_thread_artifact(
             status_code=404,
             detail={"code": "artifact_not_found", "message": str(exc)},
         ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "regenerate_rejected", "message": str(exc)},
+        ) from exc
     return envelope(thread_id=thread_id, data={"artifact": artifact.model_dump(mode="json")})

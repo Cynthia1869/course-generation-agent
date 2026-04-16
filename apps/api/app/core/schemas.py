@@ -92,6 +92,35 @@ class RequirementSlot(BaseModel):
     confirmed: bool = False
 
 
+class StepStructuredSlot(BaseModel):
+    slot_id: str
+    label: str
+    value: str
+    required: bool = True
+    confirmed: bool = True
+    source: str = "conversation"
+
+
+class StepStructuredInput(BaseModel):
+    step_id: str
+    step_label: str
+    slots: list[StepStructuredSlot] = Field(default_factory=list)
+
+
+class ConfirmedArtifactContext(BaseModel):
+    step_id: str
+    step_label: str
+    version: int
+    markdown: str
+
+
+class PromptContextLayers(BaseModel):
+    raw_session_messages: list[MessageRecord] = Field(default_factory=list)
+    structured_input: StepStructuredInput
+    confirmed_artifacts: list[ConfirmedArtifactContext] = Field(default_factory=list)
+    upload_summary: str = "无上传资料"
+
+
 class DecisionItem(BaseModel):
     decision_id: str = Field(default_factory=lambda: uuid4().hex)
     topic: str
@@ -179,6 +208,7 @@ class StepArtifactRecord(BaseModel):
 
 class DraftArtifact(BaseModel):
     artifact_id: str = Field(default_factory=lambda: uuid4().hex)
+    step_id: str | None = None
     version: int = 1
     markdown: str
     summary: str
@@ -191,6 +221,7 @@ class DraftArtifact(BaseModel):
 
 class ArtifactVersionDetail(BaseModel):
     artifact_id: str
+    step_id: str | None = None
     version: int
     markdown: str
     summary: str
@@ -299,6 +330,7 @@ class ThreadRuntimeState(BaseModel):
 class VersionRecord(BaseModel):
     version: int
     artifact_id: str
+    step_id: str | None = None
     source_version: int | None = None
     revision_goal: str | None = None
     generation_run_id: str | None = None
@@ -312,8 +344,10 @@ class GenerationRun(BaseModel):
     source_version: int | None = None
     target_version: int | None = None
     instruction: str | None = None
+    profile_name: str | None = None
     model_provider: str | None = None
     model_name: str | None = None
+    prompt_id: str | None = None
     output_preview: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
     started_at: datetime = Field(default_factory=utc_now)
@@ -341,7 +375,7 @@ class ThreadSummary(BaseModel):
     title: str = "当前对话"
     subtitle: str = ""
     course_mode: CourseMode = CourseMode.SINGLE
-    current_step_id: str = "step_1"
+    current_step_id: str = "course_title"
     latest_artifact_version: int | None = None
     review_pending: bool = False
     latest_score: float | None = None
@@ -362,6 +396,11 @@ class AuditEvent(BaseModel):
     thread_id: str
     run_id: str | None = None
     node_name: str | None = None
+    step_id: str | None = None
+    action_type: str | None = None
+    prompt_id: str | None = None
+    review_batch_id: str | None = None
+    profile_name: str | None = None
     event_type: str
     user_id: str = "default-user"
     artifact_version: int | None = None
@@ -380,7 +419,7 @@ class ThreadState(BaseModel):
     user_id: str = "default-user"
     status: ThreadStatus = ThreadStatus.COLLECTING
     course_mode: CourseMode = CourseMode.SINGLE
-    current_step_id: str = "step_1"
+    current_step_id: str = "course_title"
     requirements_confirmed: bool = False
     messages: list[MessageRecord] = Field(default_factory=list)
     requirement_slots: dict[str, RequirementSlot] = Field(default_factory=dict)

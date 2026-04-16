@@ -25,7 +25,10 @@ class StepBlueprint:
     needs_review: bool = True
     artifact_filename: str = ""
     generation_goal: str = ""
-    prompt_id: str | None = None
+    generate_prompt_id: str | None = None
+    clarify_prompt_id: str | None = None
+    review_prompt_id: str | None = None
+    improve_prompt_id: str | None = None
 
     def to_state(self) -> WorkflowStepState:
         return WorkflowStepState(
@@ -75,7 +78,10 @@ SERIES_STEP = StepBlueprint(
     forbidden_topics=("case_details", "script_content", "material_checklist"),
     artifact_filename="series_framework.md",
     generation_goal="生成系列课程框架",
-    prompt_id="generate.series_framework",
+    generate_prompt_id="generate.series_framework",
+    clarify_prompt_id="clarify.series_framework",
+    review_prompt_id="review.series_framework",
+    improve_prompt_id="improve.series_framework",
 )
 
 
@@ -89,7 +95,10 @@ SINGLE_STEPS: tuple[StepBlueprint, ...] = (
         forbidden_topics=("case_details", "script_content", "material_checklist"),
         artifact_filename="course_title.md",
         generation_goal="生成课程标题",
-        prompt_id="generate.course_title",
+        generate_prompt_id="generate.course_title",
+        clarify_prompt_id="clarify.course_title",
+        review_prompt_id="review.course_title",
+        improve_prompt_id="improve.course_title",
     ),
     StepBlueprint(
         step_id="course_framework",
@@ -101,7 +110,10 @@ SINGLE_STEPS: tuple[StepBlueprint, ...] = (
         prerequisite_step_ids=("course_title",),
         artifact_filename="course_framework.md",
         generation_goal="生成课程框架",
-        prompt_id="generate.course_framework",
+        generate_prompt_id="generate.course_framework",
+        clarify_prompt_id="clarify.course_framework",
+        review_prompt_id="review.course_framework",
+        improve_prompt_id="improve.course_framework",
     ),
     StepBlueprint(
         step_id="case_output",
@@ -113,7 +125,10 @@ SINGLE_STEPS: tuple[StepBlueprint, ...] = (
         prerequisite_step_ids=("course_title", "course_framework"),
         artifact_filename="course_cases.md",
         generation_goal="生成案例输出",
-        prompt_id="generate.case_output",
+        generate_prompt_id="generate.case_output",
+        clarify_prompt_id="clarify.case_output",
+        review_prompt_id="review.case_output",
+        improve_prompt_id="improve.case_output",
     ),
     StepBlueprint(
         step_id="script_output",
@@ -125,7 +140,10 @@ SINGLE_STEPS: tuple[StepBlueprint, ...] = (
         prerequisite_step_ids=("course_title", "course_framework", "case_output"),
         artifact_filename="course_script.md",
         generation_goal="生成逐字稿",
-        prompt_id="generate.script_output",
+        generate_prompt_id="generate.script_output",
+        clarify_prompt_id="clarify.script_output",
+        review_prompt_id="review.script_output",
+        improve_prompt_id="improve.script_output",
     ),
     StepBlueprint(
         step_id="material_checklist",
@@ -137,7 +155,10 @@ SINGLE_STEPS: tuple[StepBlueprint, ...] = (
         prerequisite_step_ids=("course_title", "course_framework", "case_output", "script_output"),
         artifact_filename="material_checklist.md",
         generation_goal="生成素材清单",
-        prompt_id="generate.material_checklist",
+        generate_prompt_id="generate.material_checklist",
+        clarify_prompt_id="clarify.material_checklist",
+        review_prompt_id="review.material_checklist",
+        improve_prompt_id="improve.material_checklist",
     ),
 )
 
@@ -146,6 +167,11 @@ STEP_CATALOG: dict[str, StepBlueprint] = {SERIES_STEP.step_id: SERIES_STEP, **{s
 MODE_STEP_IDS: dict[CourseMode, tuple[str, ...]] = {
     CourseMode.SERIES: (SERIES_STEP.step_id,),
     CourseMode.SINGLE: tuple(step.step_id for step in SINGLE_STEPS),
+}
+
+MODE_SYSTEM_PROMPT_IDS: dict[CourseMode, str] = {
+    CourseMode.SERIES: "global.series_course_system",
+    CourseMode.SINGLE: "global.single_course_system",
 }
 
 
@@ -158,6 +184,10 @@ def build_workflow_steps(mode: CourseMode) -> list[WorkflowStepState]:
 
 def get_step_blueprint(step_id: str) -> StepBlueprint:
     return STEP_CATALOG[step_id]
+
+
+def get_mode_system_prompt_id(mode: CourseMode) -> str:
+    return MODE_SYSTEM_PROMPT_IDS[mode]
 
 
 def get_slot_definition(slot_id: str) -> RequirementSlot:

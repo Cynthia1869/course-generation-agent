@@ -18,6 +18,17 @@ class PromptSpec:
     input_vars: tuple[str, ...]
     output_contract: str
     file: str
+    system_prompt_id: str | None = None
+
+
+@dataclass(frozen=True)
+class PromptBundle:
+    prompt_id: str
+    system_prompt_id: str | None
+    prompt_ids: tuple[str, ...]
+    system_prompt: str | None
+    user_prompt: str
+    combined_prompt: str
 
 
 class PromptRegistry:
@@ -33,8 +44,15 @@ class PromptRegistry:
         prompts = payload.get("prompts", [])
         catalog: dict[str, PromptSpec] = {}
         for item in prompts:
+            prompt_id = item["prompt_id"]
+            file_path = item["file"]
+            if prompt_id in catalog:
+                raise ValueError(f"Duplicate prompt_id in catalog: {prompt_id}")
+            resolved_file = self.prompt_root / file_path
+            if not resolved_file.exists():
+                raise FileNotFoundError(f"Prompt file for '{prompt_id}' not found: {file_path}")
             spec = PromptSpec(
-                prompt_id=item["prompt_id"],
+                prompt_id=prompt_id,
                 version=str(item["version"]),
                 provider=item["provider"],
                 mode=item["mode"],
@@ -42,7 +60,8 @@ class PromptRegistry:
                 purpose=item["purpose"],
                 input_vars=tuple(item.get("input_vars", [])),
                 output_contract=item["output_contract"],
-                file=item["file"],
+                file=file_path,
+                system_prompt_id=item.get("system_prompt_id"),
             )
             catalog[spec.prompt_id] = spec
         return catalog
@@ -54,9 +73,15 @@ class PromptRegistry:
 
     def validate_inputs(self, prompt_id: str, kwargs: dict[str, Any]) -> None:
         spec = self.resolve_prompt(prompt_id)
+        self._validate_spec_inputs(spec, kwargs)
+        if spec.system_prompt_id:
+            system_spec = self.resolve_prompt(spec.system_prompt_id)
+            self._validate_spec_inputs(system_spec, kwargs)
+
+    def _validate_spec_inputs(self, spec: PromptSpec, kwargs: dict[str, Any]) -> None:
         missing = [name for name in spec.input_vars if name not in kwargs or kwargs[name] is None]
         if missing:
-            raise ValueError(f"Prompt '{prompt_id}' missing required input vars: {', '.join(missing)}")
+            raise ValueError(f"Prompt '{spec.prompt_id}' missing required input vars: {', '.join(missing)}")
 
     def load_legacy(self, relative_path: str) -> str:
         return (self.prompt_root / relative_path).read_text(encoding="utf-8").strip()
@@ -79,7 +104,26 @@ class PromptRegistry:
         return template.format(**kwargs)
 
     def render_by_id(self, prompt_id: str, **kwargs: object) -> str:
+        return self.render_bundle(prompt_id, **kwargs).combined_prompt
+
+    def render_bundle(self, prompt_id: str, **kwargs: object) -> PromptBundle:
         self.validate_inputs(prompt_id, kwargs)
         spec = self.resolve_prompt(prompt_id)
-        template = self.load_legacy(spec.file)
-        return template.format(**kwargs)
+        user_prompt = self.load_legacy(spec.file).format(**kwargs)
+
+        system_prompt: str | None = None
+        prompt_ids: list[str] = [prompt_id]
+        if spec.system_prompt_id:
+            system_spec = self.resolve_prompt(spec.system_prompt_id)
+            system_prompt = self.load_legacy(system_spec.file).format(**kwargs)
+            prompt_ids.insert(0, system_spec.prompt_id)
+
+        combined_prompt = f"{system_prompt}\n\n{user_prompt}" if system_prompt else user_prompt
+        return PromptBundle(
+            prompt_id=prompt_id,
+            system_prompt_id=spec.system_prompt_id,
+            prompt_ids=tuple(prompt_ids),
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            combined_prompt=combined_prompt,
+        )

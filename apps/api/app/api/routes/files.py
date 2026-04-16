@@ -56,12 +56,13 @@ async def list_files(thread_id: str, service: CourseAgentService = Depends(get_s
 @router.get("/threads/{thread_id}/artifacts/latest", response_model=ApiEnvelope[ArtifactResponse])
 async def latest_artifact(thread_id: str, service: CourseAgentService = Depends(get_service)):
     try:
-        artifact = await service.store.latest_artifact(thread_id)
+        state = await service.store.get_thread(thread_id)
     except ThreadNotFoundError as exc:
         raise HTTPException(
             status_code=404,
             detail={"code": "thread_not_found", "message": f"Thread not found: {exc.thread_id}"},
         ) from exc
+    artifact = state.draft_artifact if state.draft_artifact and (state.draft_artifact.step_id in (None, state.current_step_id)) else None
     return envelope(thread_id=thread_id, data={"artifact": artifact.model_dump(mode="json") if artifact else None})
 
 

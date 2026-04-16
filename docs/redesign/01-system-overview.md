@@ -1,5 +1,7 @@
 # System Overview
 
+> 历史 redesign 参考。当前版本系统范围与角色入口请以 `docs/product/course-agent-overview.md` 为准，工作流与 gate 规则请以 `docs/architecture/workflow-and-gates.md` 为准。
+
 ## Summary
 - V2 目标是把制课 Agent 从“单进程 demo”提升到“小团队可上线”的状态。
 - 主链路仍是对话式制课，但底层改成可持久化、可回放、可版本化、可插拔模型层。

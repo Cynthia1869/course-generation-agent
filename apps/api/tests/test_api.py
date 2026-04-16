@@ -13,7 +13,7 @@ if str(API_ROOT) not in sys.path:
     sys.path.insert(0, str(API_ROOT))
 
 from app.api.deps import get_deepagents_service, get_service
-from app.core.schemas import ConfirmStepRequest, DraftArtifact, GenerationSessionState, ModeUpdateRequest, RegenerateRequest, ReviewBatch, ReviewSubmitRequest, ReviewCriterionResult
+from app.core.schemas import ConfirmStepRequest, DraftArtifact, GenerationSessionState, ModeUpdateRequest, RegenerateRequest, ReviewBatch, ReviewSubmitRequest, ReviewCriterionResult, ThreadState, ThreadSummary
 from app.core.settings import get_settings
 from app.main import app
 
@@ -72,6 +72,15 @@ async def test_thread_lifecycle():
         }
 
 
+def test_state_defaults_use_new_step_id_system():
+    state = ThreadState(thread_id="t-1")
+    summary = ThreadSummary(thread_id="t-1", user_id="u-1", status="collecting_requirements")
+    assert state.current_step_id == "course_title"
+    assert summary.current_step_id == "course_title"
+    assert state.current_step_id != "step_1"
+    assert summary.current_step_id != "step_1"
+
+
 @pytest.mark.asyncio
 async def test_thread_generation_persists_artifact_and_review_batch():
     service = get_service()
@@ -113,8 +122,14 @@ async def test_low_score_triggers_auto_optimization_loop(monkeypatch: pytest.Mon
     service = get_service()
     calls = {"review": 0, "improve": 0}
 
-    async def fake_review_markdown(*, markdown: str, rubric: list[dict], threshold: float):
+    async def fake_review_markdown(**kwargs):
+        markdown = kwargs["markdown"]
+        rubric = kwargs["rubric"]
+        step_label = kwargs.get("step_label", "当前步骤产物")
+        forbidden_topics = kwargs.get("forbidden_topics", "无")
         calls["review"] += 1
+        assert step_label == "课程标题"
+        assert forbidden_topics
         if calls["review"] == 1:
             return {
                 "total_score": 6.5,
@@ -182,10 +197,15 @@ async def test_timeline_versions_and_regenerate_endpoint(monkeypatch: pytest.Mon
     service = get_service()
 
     async def fake_improve_markdown(**kwargs):
-        assert "不要咖啡馆案例" in kwargs["constraint_summary"]
+        assert any("不要咖啡馆案例" in item for item in kwargs["approved_changes"])
         return kwargs["markdown"] + "\n\n## 修订说明\n\n已替换为办公场景案例。"
 
-    async def fake_review_markdown(*, markdown: str, rubric: list[dict], threshold: float):
+    async def fake_review_markdown(**kwargs):
+        rubric = kwargs["rubric"]
+        step_label = kwargs.get("step_label", "当前步骤产物")
+        forbidden_topics = kwargs.get("forbidden_topics", "无")
+        assert step_label == "课程标题"
+        assert forbidden_topics
         return {
             "total_score": 8.6,
             "criteria": [
@@ -233,6 +253,61 @@ async def test_timeline_versions_and_regenerate_endpoint(monkeypatch: pytest.Mon
 
     versions = await service.list_versions(thread.thread_id)
     assert len(versions) >= 2
+
+
+@pytest.mark.asyncio
+async def test_critique_score_review_receives_current_step_boundary(monkeypatch: pytest.MonkeyPatch):
+    service = get_service()
+    captured: list[tuple[str, str]] = []
+
+    async def fake_review_markdown(**kwargs):
+        captured.append((kwargs.get("step_label", "当前步骤产物"), kwargs.get("forbidden_topics", "无")))
+        return {
+            "total_score": 8.6,
+            "criteria": [],
+            "suggestions": [],
+        }
+
+    monkeypatch.setattr(service.graph.deepseek, "review_markdown", fake_review_markdown)
+
+    thread = await service.create_thread()
+    await service.ingest_message(
+        thread.thread_id,
+        "我要做一门入门课，给初中生，主题是三角函数，解决基础题不会做的问题，学完能独立完成基础题，风格实操带练，时长90分钟，要求基于真实案例。",
+        "default-user",
+    )
+    await service.ingest_message(thread.thread_id, "开始生成", "default-user")
+
+    assert captured[-1] == ("课程标题", "case_details、script_content、material_checklist")
+
+
+@pytest.mark.asyncio
+async def test_regenerate_review_receives_current_step_boundary(monkeypatch: pytest.MonkeyPatch):
+    service = get_service()
+    captured: list[tuple[str, str]] = []
+
+    async def fake_review_markdown(**kwargs):
+        captured.append((kwargs.get("step_label", "当前步骤产物"), kwargs.get("forbidden_topics", "无")))
+        return {
+            "total_score": 8.6,
+            "criteria": [],
+            "suggestions": [],
+        }
+
+    monkeypatch.setattr(service.graph.deepseek, "review_markdown", fake_review_markdown)
+
+    thread = await service.create_thread()
+    await service.ingest_message(
+        thread.thread_id,
+        "我要做一门入门课，给初中生，主题是三角函数，解决基础题不会做的问题，学完能独立完成基础题，风格实操带练，时长90分钟，要求基于真实案例。",
+        "default-user",
+    )
+    await service.ingest_message(thread.thread_id, "开始生成", "default-user")
+
+    state = await service.store.get_thread(thread.thread_id)
+    await service.regenerate(thread.thread_id, RegenerateRequest(instruction="换一个标题版本", base_version=state.draft_artifact.version))
+
+    assert captured[-1] == ("课程标题", "case_details、script_content、material_checklist")
 
 
 @pytest.mark.asyncio
@@ -359,7 +434,12 @@ async def test_completion_gate_all_rejected_but_score_passes(monkeypatch: pytest
     get_service.cache_clear()
     service = get_service()
 
-    async def fake_review_markdown(*, markdown: str, rubric: list[dict], threshold: float):
+    async def fake_review_markdown(**kwargs):
+        rubric = kwargs["rubric"]
+        step_label = kwargs.get("step_label", "当前步骤产物")
+        forbidden_topics = kwargs.get("forbidden_topics", "无")
+        assert step_label == "系列课程框架"
+        assert forbidden_topics
         return {
             "total_score": 8.8,
             "criteria": [
@@ -422,7 +502,12 @@ async def test_interrupt_resume_survives_service_restart(monkeypatch: pytest.Mon
     get_service.cache_clear()
     service = get_service()
 
-    async def fake_review_markdown(*, markdown: str, rubric: list[dict], threshold: float):
+    async def fake_review_markdown(**kwargs):
+        rubric = kwargs["rubric"]
+        step_label = kwargs.get("step_label", "当前步骤产物")
+        forbidden_topics = kwargs.get("forbidden_topics", "无")
+        assert step_label == "系列课程框架"
+        assert forbidden_topics
         return {
             "total_score": 8.5,
             "criteria": [
@@ -491,7 +576,12 @@ async def test_auto_optimization_loops_do_not_leak_into_regenerate(monkeypatch: 
     service = get_service()
     calls = {"review": 0}
 
-    async def fake_review_markdown(*, markdown: str, rubric: list[dict], threshold: float):
+    async def fake_review_markdown(**kwargs):
+        rubric = kwargs["rubric"]
+        step_label = kwargs.get("step_label", "当前步骤产物")
+        forbidden_topics = kwargs.get("forbidden_topics", "无")
+        assert step_label == "课程标题"
+        assert forbidden_topics
         calls["review"] += 1
         if calls["review"] == 1:
             return {
@@ -691,7 +781,12 @@ async def test_confirm_gate_requires_explicit_start_generate_after_required_slot
 async def test_series_review_gate_keeps_series_framework_pending_after_generation(monkeypatch: pytest.MonkeyPatch):
     service = get_service()
 
-    async def fake_review_markdown(*, markdown: str, rubric: list[dict], threshold: float):
+    async def fake_review_markdown(**kwargs):
+        rubric = kwargs["rubric"]
+        step_label = kwargs.get("step_label", "当前步骤产物")
+        forbidden_topics = kwargs.get("forbidden_topics", "无")
+        assert step_label == "系列课程框架"
+        assert forbidden_topics
         return {
             "total_score": 8.8,
             "criteria": [

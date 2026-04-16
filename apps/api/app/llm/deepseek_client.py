@@ -20,6 +20,16 @@ from app.core.settings import Settings
 class ProviderProfiles:
     chat: LLMProviderConfig
     review: LLMProviderConfig
+    clarify: LLMProviderConfig | None = None
+    extract: LLMProviderConfig | None = None
+    generate: LLMProviderConfig | None = None
+    improve: LLMProviderConfig | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "clarify", self.clarify or self.chat)
+        object.__setattr__(self, "extract", self.extract or self.chat)
+        object.__setattr__(self, "generate", self.generate or self.chat)
+        object.__setattr__(self, "improve", self.improve or self.generate or self.review or self.chat)
 
 
 class RequirementExtractionResult(BaseModel):
@@ -56,8 +66,14 @@ class DeepSeekClient:
             providers = payload.get("providers", {})
             profiles = payload.get("profiles", {})
 
-            def build_profile(name: str, fallback_temperature: float) -> LLMProviderConfig:
-                profile_payload = profiles.get(name, {})
+            def build_profile(name: str, fallback_temperature: float, fallback_order: tuple[str, ...] = ()) -> LLMProviderConfig:
+                profile_payload = profiles.get(name) or {}
+                if "model" not in profile_payload:
+                    for fallback_name in fallback_order:
+                        candidate = profiles.get(fallback_name) or {}
+                        if "model" in candidate:
+                            profile_payload = candidate
+                            break
                 provider_name = profile_payload.get("provider", payload.get("default_provider", "deepseek"))
                 provider_payload = providers.get(provider_name, {})
                 return LLMProviderConfig(
@@ -71,7 +87,11 @@ class DeepSeekClient:
 
             return ProviderProfiles(
                 chat=build_profile("chat", 0.4),
-                review=build_profile("review", 0.1),
+                review=build_profile("review", 0.1, fallback_order=("generate", "chat")),
+                clarify=build_profile("clarify", 0.2, fallback_order=("chat",)),
+                extract=build_profile("extract", 0.0, fallback_order=("chat",)),
+                generate=build_profile("generate", 0.3, fallback_order=("review", "chat")),
+                improve=build_profile("improve", 0.3, fallback_order=("generate", "review", "chat")),
             )
 
         payload = yaml.safe_load(self.settings.deepseek_config_file.read_text(encoding="utf-8")) or {}
@@ -84,20 +104,62 @@ class DeepSeekClient:
                 api_key_env="DEEPSEEK_API_KEY",
                 base_url=self.settings.deepseek_base_url,
             ),
+            clarify=LLMProviderConfig(
+                provider="deepseek",
+                model=payload.get("clarify_model", payload["chat_model"]),
+                temperature=float(payload.get("clarify_temperature", 0.2)),
+                api_base_env="DEEPSEEK_BASE_URL",
+                api_key_env="DEEPSEEK_API_KEY",
+                base_url=self.settings.deepseek_base_url,
+            ),
+            extract=LLMProviderConfig(
+                provider="deepseek",
+                model=payload.get("extract_model", payload["chat_model"]),
+                temperature=float(payload.get("extract_temperature", 0.0)),
+                api_base_env="DEEPSEEK_BASE_URL",
+                api_key_env="DEEPSEEK_API_KEY",
+                base_url=self.settings.deepseek_base_url,
+            ),
+            generate=LLMProviderConfig(
+                provider="deepseek",
+                model=payload.get("generate_model", payload["chat_model"]),
+                temperature=float(payload.get("generate_temperature", payload.get("chat_temperature", 0.4))),
+                api_base_env="DEEPSEEK_BASE_URL",
+                api_key_env="DEEPSEEK_API_KEY",
+                base_url=self.settings.deepseek_base_url,
+            ),
             review=LLMProviderConfig(
                 provider="deepseek",
-                model=payload["review_model"],
+                model=payload.get("review_model", payload["chat_model"]),
                 temperature=float(payload.get("review_temperature", 0.1)),
+                api_base_env="DEEPSEEK_BASE_URL",
+                api_key_env="DEEPSEEK_API_KEY",
+                base_url=self.settings.deepseek_base_url,
+            ),
+            improve=LLMProviderConfig(
+                provider="deepseek",
+                model=payload.get("improve_model", payload.get("review_model", payload["chat_model"])),
+                temperature=float(payload.get("improve_temperature", 0.3)),
                 api_base_env="DEEPSEEK_BASE_URL",
                 api_key_env="DEEPSEEK_API_KEY",
                 base_url=self.settings.deepseek_base_url,
             ),
         )
 
-    def can_use_remote_llm(self) -> bool:
+    def get_profile(self, action: str) -> LLMProviderConfig:
+        try:
+            return getattr(self.profile, action)
+        except AttributeError as exc:
+            raise KeyError(f"Unknown llm profile action: {action}") from exc
+
+    def get_profile_name(self, action: str) -> str:
+        self.get_profile(action)
+        return action
+
+    def can_use_remote_llm(self, action: str = "chat") -> bool:
         if self.settings.app_env == "test":
             return False
-        return bool(self._resolve_api_key(self.profile.chat))
+        return bool(self._resolve_api_key(self.get_profile(action)))
 
     def _resolve_api_key(self, profile: LLMProviderConfig) -> str | None:
         if profile.api_key_env:
@@ -126,7 +188,7 @@ class DeepSeekClient:
                 yield chunk
             return
 
-        model = self._build_chat_model(self.profile.chat)
+        model = self._build_chat_model(self.get_profile("generate"))
         prompt = self.prompts.render_by_id(
             "generate.legacy_full_draft",
             decision_summary=context["decision_summary"],
@@ -136,7 +198,7 @@ class DeepSeekClient:
             constraint_summary=context.get("constraint_summary", "无额外约束"),
         )
         async for chunk in model.astream(prompt):
-            text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+            text = self._response_text(chunk)
             if text:
                 yield text
 
@@ -146,21 +208,21 @@ class DeepSeekClient:
                 yield chunk
             return
 
-        model = self._build_chat_model(self.profile.chat)
+        model = self._build_chat_model(self.get_profile("generate"))
         prompt = self.prompts.render_by_id(
             context["prompt_id"],
             step_label=context["step_label"],
+            step_scope=context["step_scope"],
+            allowed_input_layers=context["allowed_input_layers"],
+            forbidden_input_layers=context["forbidden_input_layers"],
+            output_contract=context["output_contract"],
             generation_goal=context["generation_goal"],
-            required_slots=context["required_slots"],
-            optional_slots=context["optional_slots"],
-            forbidden_topics=context["forbidden_topics"],
-            slot_summary=context["slot_summary"],
+            structured_inputs=context["structured_inputs"],
+            confirmed_artifacts=context["confirmed_artifacts"],
             source_summary=context["source_summary"],
-            prior_step_artifacts=context["prior_step_artifacts"],
-            constraint_summary=context.get("constraint_summary", "无额外约束"),
         )
         async for chunk in model.astream(prompt):
-            text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+            text = self._response_text(chunk)
             if text:
                 yield text
 
@@ -169,24 +231,21 @@ class DeepSeekClient:
             item = context["missing_requirement"]
             return "为了继续制课，我还需要你补充这一个关键信息：\n" + f"- {item['label']}：{item['prompt_hint']}"
 
-        model = self._build_chat_model(
-            LLMProviderConfig.model_validate(
-                {
-                    **self.profile.chat.model_dump(),
-                    "temperature": 0.2,
-                }
-            )
-        )
+        model = self._build_chat_model(self.get_profile("clarify"))
         prompt = self.prompts.render_by_id(
             context.get("prompt_id", "clarify.course_title"),
             step_label=context.get("step_label", "当前步骤"),
+            step_scope=context.get("step_scope", "只允许处理当前步骤"),
+            allowed_input_layers=context.get("allowed_input_layers", "当前步骤结构化输入、上传资料摘要"),
+            forbidden_input_layers=context.get("forbidden_input_layers", "原始聊天消息、未来步骤内容、未确认产物"),
+            output_contract=context.get("output_contract", "只追问当前步骤一个缺失项"),
             allowed_scope=context.get("allowed_scope", "仅限当前步骤信息"),
             forbidden_scope=context.get("forbidden_scope", "不要追问其他步骤内容"),
-            slot_summary=context["slot_summary"],
+            structured_inputs=context["structured_inputs"],
             missing_requirements=f"- {context['missing_requirement']['label']}：{context['missing_requirement']['prompt_hint']}",
         )
         response = await model.ainvoke(prompt)
-        return response.content if isinstance(response.content, str) else str(response.content)
+        return self._response_text(response)
 
     async def stream_clarification(self, context: dict) -> AsyncIterator[str]:
         if not self.can_use_remote_llm():
@@ -199,24 +258,21 @@ class DeepSeekClient:
                 yield chunk
             return
 
-        model = self._build_chat_model(
-            LLMProviderConfig.model_validate(
-                {
-                    **self.profile.chat.model_dump(),
-                    "temperature": 0.2,
-                }
-            )
-        )
+        model = self._build_chat_model(self.get_profile("clarify"))
         prompt = self.prompts.render_by_id(
             context["prompt_id"],
             step_label=context.get("step_label", "当前步骤"),
+            step_scope=context.get("step_scope", "只允许处理当前步骤"),
+            allowed_input_layers=context.get("allowed_input_layers", "当前步骤结构化输入、上传资料摘要"),
+            forbidden_input_layers=context.get("forbidden_input_layers", "原始聊天消息、未来步骤内容、未确认产物"),
+            output_contract=context.get("output_contract", "只追问当前步骤一个缺失项"),
             allowed_scope=context.get("allowed_scope", "仅限当前步骤信息"),
             forbidden_scope=context.get("forbidden_scope", "不要追问其他步骤内容"),
-            slot_summary=context["slot_summary"],
+            structured_inputs=context["structured_inputs"],
             missing_requirements=f"- {context['missing_requirement']['label']}：{context['missing_requirement']['prompt_hint']}",
         )
         async for chunk in model.astream(prompt):
-            text = chunk.content if isinstance(chunk.content, str) else str(chunk.content)
+            text = self._response_text(chunk)
             if text:
                 yield text
 
@@ -232,14 +288,7 @@ class DeepSeekClient:
         if not self.can_use_remote_llm():
             return self._fallback_extract_requirements(latest_user_message)
 
-        model = self._build_chat_model(
-            LLMProviderConfig.model_validate(
-                {
-                    **self.profile.chat.model_dump(),
-                    "temperature": 0.0,
-                }
-            )
-        )
+        model = self._build_chat_model(self.get_profile("extract"))
         prompt = self.prompts.render_by_id(
             "extract.requirements",
             requirement_defs="\n".join(f"- {item['slot_id']}: {item['label']}，{item['prompt_hint']}" for item in requirement_defs),
@@ -327,18 +376,34 @@ class DeepSeekClient:
 
         return extracted
 
-    async def review_markdown(self, *, markdown: str, rubric: list[dict], threshold: float, step_label: str = "当前步骤产物", forbidden_topics: str = "无") -> dict:
+    async def review_markdown(
+        self,
+        *,
+        prompt_id: str,
+        markdown: str,
+        rubric: list[dict],
+        threshold: float,
+        step_label: str = "当前步骤产物",
+        step_scope: str = "只允许评审当前步骤",
+        allowed_input_layers: str = "当前步骤结构化输入、已确认前序产物、上传资料摘要、当前步骤产物",
+        forbidden_input_layers: str = "未来步骤内容、未确认产物、reasoning 内容、原始聊天消息",
+        forbidden_topics: str = "无",
+    ) -> dict:
         if not self.can_use_remote_llm():
             return self._fallback_review(markdown=markdown, rubric=rubric, threshold=threshold)
 
-        model = self._build_chat_model(self.profile.review)
+        model = self._build_chat_model(self.get_profile("review"))
         rubric_text = "\n".join(
             f"- {item['criterion_id']}: {item['name']} ({item['description']})"
             for item in rubric
         )
         prompt = self.prompts.render_by_id(
-            "review.step_artifact",
+            prompt_id,
             step_label=step_label,
+            step_scope=step_scope,
+            allowed_input_layers=allowed_input_layers,
+            forbidden_input_layers=forbidden_input_layers,
+            output_contract="只评审当前步骤当前版本，不改写前序已确认内容，不把未来步骤当成缺陷。",
             threshold=threshold,
             rubric_text=rubric_text,
             markdown=markdown,
@@ -350,14 +415,16 @@ class DeepSeekClient:
     async def improve_markdown(
         self,
         *,
+        prompt_id: str,
         markdown: str,
         approved_changes: list[str],
-        context_summary: str,
-        constraint_summary: str = "无额外约束",
+        structured_inputs: str,
+        confirmed_artifacts: str = "暂无已确认前序产物",
+        source_summary: str = "无上传资料",
         source_version: int | None = None,
         revision_goal: str | None = None,
         step_label: str = "当前步骤产物",
-        prior_step_artifacts: str = "暂无",
+        step_scope: str = "只允许修订当前步骤",
     ) -> str:
         if not approved_changes:
             return markdown
@@ -367,27 +434,40 @@ class DeepSeekClient:
             goal = f"\n修订目标：{revision_goal}" if revision_goal else ""
             return f"{markdown}\n\n## 自动优化说明\n\n本轮自动优化已执行：\n{lines}{extra}{goal}"
 
-        model = self._build_chat_model(
-            LLMProviderConfig.model_validate(
-                {
-                    **self.profile.chat.model_dump(),
-                    "temperature": 0.3,
-                }
-            )
-        )
+        model = self._build_chat_model(self.get_profile("improve"))
         prompt = self.prompts.render_by_id(
-            "improve.step_artifact",
+            prompt_id,
             step_label=step_label,
-            context_summary=context_summary,
+            step_scope=step_scope,
+            allowed_input_layers="当前步骤结构化输入、已确认前序产物、上传资料摘要、当前步骤产物、当前轮改进要求",
+            forbidden_input_layers="未来步骤内容、未确认产物、reasoning 内容、原始聊天消息",
+            output_contract="只返回当前步骤修订后的完整 Markdown。",
+            structured_inputs=structured_inputs,
+            confirmed_artifacts=confirmed_artifacts,
+            source_summary=source_summary,
             approved_changes="\n".join(f"- {item}" for item in approved_changes),
             markdown=markdown,
-            constraint_summary=constraint_summary,
             source_version=source_version or "未指定",
             revision_goal=revision_goal or "根据反馈生成更好的新版本",
-            prior_step_artifacts=prior_step_artifacts,
         )
         response = await model.ainvoke(prompt)
-        return response.content if isinstance(response.content, str) else str(response.content)
+        return self._response_text(response)
+
+    def _response_text(self, response: object) -> str:
+        # DeepSeek reasoning models may expose reasoning content via side channels such as
+        # additional_kwargs. Business state must only persist the final answer content.
+        content = getattr(response, "content", response)
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(str(item.get("text", "")))
+            return "".join(parts)
+        return str(content)
 
     def _fallback_markdown(self, context: dict) -> str:
         topic = context["slots"].get("topic", "待补充主题")
@@ -489,21 +569,21 @@ class DeepSeekClient:
 
             本步骤目标：{context['generation_goal']}
 
-            ## 当前已确认信息
+            ## 当前步骤边界
 
-            {context['slot_summary'] or '暂无'}
+            {context['step_scope']}
 
-            ## 上游已确认产物
+            ## 当前步骤结构化输入
 
-            {context['prior_step_artifacts'] or '暂无'}
+            {context['structured_inputs'] or '暂无当前步骤结构化输入'}
+
+            ## 已确认前序产物
+
+            {context['confirmed_artifacts'] or '暂无已确认前序产物'}
 
             ## 上传资料摘要
 
             {context['source_summary'] or '无上传资料'}
-
-            ## 必须遵守的约束
-
-            {context.get('constraint_summary', '无额外约束')}
             """
         ).strip()
 

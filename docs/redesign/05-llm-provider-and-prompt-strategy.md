@@ -1,5 +1,7 @@
 # LLM Provider And Prompt Strategy
 
+> 历史 redesign 参考。当前模型与 prompt 规范请以 `docs/architecture/workflow-and-gates.md` 和 `docs/operations/prompt-management.md` 为准。
+
 ## Summary
 - 运行默认仍是 DeepSeek。
 - 模型切换通过 `config/llm.yaml` 完成，而不是改业务代码。

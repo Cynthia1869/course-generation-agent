@@ -11,7 +11,23 @@ profiles:
     provider: deepseek
     model: deepseek-chat
     temperature: 0.4
-  review:
+  clarify:
     provider: deepseek
     model: deepseek-chat
+    temperature: 0.2
+  extract:
+    provider: deepseek
+    model: deepseek-chat
+    temperature: 0.0
+  generate:
+    provider: deepseek
+    model: deepseek-reasoner
+    temperature: 0.3
+  review:
+    provider: deepseek
+    model: deepseek-reasoner
     temperature: 0.1
+  improve:
+    provider: deepseek
+    model: deepseek-reasoner
+    temperature: 0.3

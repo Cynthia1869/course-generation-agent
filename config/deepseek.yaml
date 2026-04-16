@@ -1,4 +1,12 @@
 chat_model: deepseek-chat
-review_model: deepseek-chat
 chat_temperature: 0.4
+clarify_model: deepseek-chat
+clarify_temperature: 0.2
+extract_model: deepseek-chat
+extract_temperature: 0.0
+generate_model: deepseek-reasoner
+generate_temperature: 0.3
+review_model: deepseek-reasoner
 review_temperature: 0.1
+improve_model: deepseek-reasoner
+improve_temperature: 0.3

@@ -1,5 +1,7 @@
 # Conversation State Machine
 
+> 历史 redesign 参考。当前版本的 step 规则与确认条件请以 `docs/product/single-course-step-spec.md` 和 `docs/architecture/workflow-and-gates.md` 为准。
+
 ## Summary
 - 对话状态机只解决一件事：把用户从需求模糊带到课程可交付，并且在每一步都有可解释状态。
 

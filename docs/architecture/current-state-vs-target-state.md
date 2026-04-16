@@ -1,5 +1,7 @@
 # Current State vs Target State
 
+> 历史重构文档。当前版本的产品边界、工作流规则和运维入口请以 `docs/product/`、`docs/architecture/workflow-and-gates.md`、`docs/operations/` 为准。本文档只保留“当时为什么要重构”的背景，不再作为当前规范的主事实来源。
+
 ## Current State
 
 ### 当前真实主链路

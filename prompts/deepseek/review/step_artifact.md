@@ -1,11 +1,22 @@
-请你作为课程内容评审员，只评审“{step_label}”这一个步骤的当前产物，不要把后续步骤内容当成必须项。
+请你只评审“{step_label}”这一个步骤的当前产物。
 
-当前步骤禁止涉及的话题：
+当前步骤禁止提前展开的话题：
 {forbidden_topics}
 
-请严格按 rubric 评分，并返回 JSON。
+阈值：
+{threshold}
 
-JSON 结构:
+Rubric：
+{rubric_text}
+
+当前 Markdown：
+{markdown}
+
+返回要求：
+1. 只返回 JSON
+2. 只根据当前步骤要求评分
+3. 不要把未来步骤缺失当成当前步骤缺陷
+4. JSON 结构必须是：
 {{
   "total_score": 0,
   "criteria": [
@@ -28,11 +39,3 @@ JSON 结构:
     }}
   ]
 }}
-
-阈值是 {threshold}。只返回 JSON。
-
-Rubric:
-{rubric_text}
-
-Markdown:
-{markdown}

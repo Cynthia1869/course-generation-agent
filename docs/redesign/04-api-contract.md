@@ -1,5 +1,7 @@
 # API Contract
 
+> 历史 redesign 参考。当前 API 总览以 `docs/api/http-api.md` 为准，字段级契约以 `docs/api/openapi.json` 为准。
+
 ## Source of Truth
 
 - 机器契约：`docs/api/openapi.json`

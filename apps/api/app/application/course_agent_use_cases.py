@@ -118,7 +118,7 @@ class CourseAgentSupport:
     def next_step_id(self, state) -> str:
         ids = [item.step_id for item in state.workflow_steps]
         if state.current_step_id not in ids:
-            return ids[0] if ids else "step_1"
+            return ids[0] if ids else "course_title"
         index = ids.index(state.current_step_id)
         return ids[min(index + 1, len(ids) - 1)]
 
@@ -213,6 +213,7 @@ class ThreadUseCases:
         state.workflow_steps = self.support.build_workflow_steps(request.mode)
         state.step_artifacts = self.support.build_step_artifacts(state.workflow_steps)
         state.current_step_id = state.workflow_steps[0].step_id if state.workflow_steps else "course_title"
+        state.requirements_confirmed = False
         state.draft_artifact = None
         state.review_batches = []
         state.approved_feedback = []
@@ -265,6 +266,7 @@ class ThreadUseCases:
             state.current_step_id = next_step_id
             self.support.sync_step_status(state)
             state.status = ThreadStatus.COLLECTING
+            state.requirements_confirmed = False
             state.runtime.clarification = state.runtime.clarification.model_copy(update={"missing_requirements": [], "next_requirement_to_clarify": None, "slot_summary": "暂无", "latest_user_message": "", "is_confirmation_reply": False})
             state.runtime.generation_session = None
             state.draft_artifact = None
@@ -309,10 +311,12 @@ class ConversationUseCases:
             if constraint.normalized_instruction not in existing_constraint_keys:
                 state.conversation_constraints.append(constraint)
                 existing_constraint_keys.add(constraint.normalized_instruction)
-        if state.requirements_confirmed and state.draft_artifact is not None:
+        current_step_has_draft = state.draft_artifact is not None and state.draft_artifact.step_id == state.current_step_id
+        if current_step_has_draft:
             state.runtime.pending_manual_revision_request = content
             state.status = ThreadStatus.REVISING
         else:
+            state.runtime.pending_manual_revision_request = None
             state.status = ThreadStatus.COLLECTING
         await self.support.store.save_thread(state)
         await self.support.audit.record(
@@ -361,6 +365,11 @@ class ArtifactUseCases:
     async def update_artifact(self, thread_id: str, markdown: str):
         artifact = await self.support.store.update_artifact_content(thread_id, markdown)
         state = await self.support.store.get_thread(thread_id)
+        artifact.step_id = state.current_step_id
+        state.draft_artifact = artifact
+        if state.version_chain:
+            state.version_chain[-1].step_id = state.current_step_id
+        await self.support.store.upsert_artifact_version(thread_id, artifact)
         self.support.sync_step_artifact_generated(
             state,
             step_id=state.current_step_id,
@@ -408,16 +417,22 @@ class ArtifactUseCases:
 
     async def regenerate(self, thread_id: str, request: RegenerateRequest) -> DraftArtifact:
         state = await self.support.store.get_thread(thread_id)
+        step = self.support.graph._current_step(state)
         base_version = request.base_version or (state.draft_artifact.version if state.draft_artifact else None)
         if base_version is None:
             raise KeyError("No artifact version available for regeneration")
         base_artifact = await self.support.store.get_artifact_version(thread_id, base_version)
+        if base_artifact.step_id and base_artifact.step_id != state.current_step_id:
+            raise ValueError("Only the active step artifact can be regenerated")
+        context_layers = await self.support.graph._build_prompt_context_layers(state, step)
         generation_run = GenerationRun(
             kind=GenerationRunKind.REVISION,
             source_version=base_artifact.version,
             instruction=request.instruction,
-            model_provider=self.support.graph.deepseek.profile.chat.provider,
-            model_name=self.support.graph.deepseek.profile.chat.model,
+            profile_name="improve",
+            model_provider=self.support.graph.deepseek.get_profile("improve").provider,
+            model_name=self.support.graph.deepseek.get_profile("improve").model,
+            prompt_id=step.improve_prompt_id or "improve.step_artifact",
         )
         state.generation_runs.append(generation_run)
         state.status = ThreadStatus.REVISING
@@ -430,6 +445,21 @@ class ArtifactUseCases:
             detail=request.instruction,
             payload={"base_version": base_artifact.version, "run_id": generation_run.run_id},
         )
+        await self.support.audit.record(
+            AuditEvent(
+                thread_id=thread_id,
+                run_id=generation_run.run_id,
+                step_id=state.current_step_id,
+                action_type="regenerate",
+                prompt_id=step.improve_prompt_id or "improve.step_artifact",
+                profile_name="improve",
+                event_type="REVISION_STARTED",
+                artifact_version=base_artifact.version,
+                model_provider=generation_run.model_provider,
+                model_name=generation_run.model_name,
+                payload_summary={"base_version": base_artifact.version, "instruction": request.instruction},
+            )
+        )
         await self.support.broker.publish(
             thread_id,
             {"type": "revision_started", "thread_id": thread_id, "payload": {"base_version": base_artifact.version, "instruction": request.instruction}},
@@ -441,17 +471,20 @@ class ArtifactUseCases:
             if action.edited_suggestion:
                 instructions.append(action.edited_suggestion)
         markdown = await self.support.graph.deepseek.improve_markdown(
+            prompt_id=step.improve_prompt_id or "improve.step_artifact",
             markdown=base_artifact.markdown,
             approved_changes=instructions,
-            context_summary=state.decision_summary,
-            constraint_summary=self.support.constraint_summary(state),
+            structured_inputs=self.support.graph._structured_inputs_text(context_layers.structured_input),
+            confirmed_artifacts=self.support.graph._confirmed_artifacts_text(context_layers.confirmed_artifacts),
+            source_summary=context_layers.upload_summary,
             source_version=base_artifact.version,
             revision_goal=request.instruction,
-            step_label=next((step.label for step in state.workflow_steps if step.step_id == state.current_step_id), "当前步骤产物"),
-            prior_step_artifacts=self.support.graph._prior_step_artifacts_summary(state, self.support.graph._current_step(state)),
+            step_label=step.label,
+            step_scope=self.support.graph._step_scope(step),
         )
         next_version = max([item.version for item in await self.support.store.list_versions(thread_id)], default=0) + 1
         artifact = DraftArtifact(
+            step_id=step.step_id,
             version=next_version,
             markdown=markdown,
             summary="根据人工指令重新生成的新版本课程稿。",
@@ -469,6 +502,7 @@ class ArtifactUseCases:
             VersionRecord(
                 version=artifact.version,
                 artifact_id=artifact.artifact_id,
+                step_id=step.step_id,
                 source_version=artifact.source_version,
                 revision_goal=artifact.revision_goal,
                 generation_run_id=artifact.generation_run_id,
@@ -483,9 +517,15 @@ class ArtifactUseCases:
         )
         await self.support.store.upsert_artifact_version(thread_id, artifact)
         review_result = await self.support.graph.deepseek.review_markdown(
+            prompt_id=step.review_prompt_id or "review.step_artifact",
             markdown=artifact.markdown,
             rubric=RUBRIC,
             threshold=self.settings.default_review_threshold,
+            step_label=step.label,
+            step_scope=self.support.graph._step_scope(step),
+            allowed_input_layers="当前步骤结构化输入、已确认前序产物、上传资料摘要、当前步骤产物",
+            forbidden_input_layers="未来步骤内容、未确认产物、reasoning 内容、原始聊天消息",
+            forbidden_topics="、".join(step.forbidden_topics) or "无",
         )
         batch = ReviewBatch(
             step_id=state.current_step_id,
@@ -506,6 +546,23 @@ class ArtifactUseCases:
         await self.support.store.append_review_batch(thread_id, batch)
         state.status = ThreadStatus.REVIEW_PENDING
         await self.support.store.save_thread(state)
+        review_profile = self.support.graph.deepseek.get_profile("review")
+        await self.support.audit.record(
+            AuditEvent(
+                thread_id=thread_id,
+                run_id=generation_run.run_id,
+                step_id=state.current_step_id,
+                action_type="review",
+                prompt_id=step.review_prompt_id or "review.step_artifact",
+                review_batch_id=batch.review_batch_id,
+                profile_name="review",
+                event_type="REVIEW_BATCH_CREATED",
+                artifact_version=artifact.version,
+                model_provider=review_profile.provider,
+                model_name=review_profile.model,
+                payload_summary={"review_batch_id": batch.review_batch_id, "score": batch.total_score},
+            )
+        )
         await self.support.record_timeline(
             thread_id,
             "revision_completed",
@@ -530,9 +587,11 @@ class ReviewUseCases:
 
     async def submit_review(self, thread_id: str, batch_id: str, review_request: ReviewSubmitRequest) -> None:
         state = await self.support.store.get_thread(thread_id)
+        latest_batch = state.review_batches[-1] if state.review_batches else None
+        if latest_batch is None or latest_batch.review_batch_id != batch_id or latest_batch.step_id != state.current_step_id:
+            raise ValueError("Only the active step review batch can be submitted")
         state.approved_feedback = review_request.review_actions
         state.status = ThreadStatus.REVISING
-        latest_batch = state.review_batches[-1] if state.review_batches else None
         suggestions_by_id = {suggestion.suggestion_id: suggestion for suggestion in (latest_batch.suggestions if latest_batch else [])}
         conversation_context = "\n".join(message.content for message in state.messages[-6:] if message.role == MessageRole.USER)
         draft_excerpt = state.draft_artifact.markdown[:1500] if state.draft_artifact else ""

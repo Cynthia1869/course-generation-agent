@@ -1,62 +1,66 @@
-# Decision Model
+# 决策模型状态
 
-## Current Status
+## 当前状态
 
-当前系统已经开始沉淀决策训练样本，但还没有自动学习。
+系统具备决策记录沉淀与导出链路。本文档描述现行的运维与调试事实。
 
-人工审核提交后，会把以下信息沉淀为训练记录：
+## 已实现能力
 
-- 用户上下文
+- 人工审核动作会沉淀为 `DecisionRecord`
+- 线程级和全局决策记录可通过 API 导出
+- 本地 JSONL 数据可导出、训练和预测
+
+## 边界说明
+
+- 本文档覆盖离线数据沉淀、导出、训练和预测入口
+- 本文档不定义在线模型切换与自动学习流程
+
+## 数据来源
+
+每条决策记录当前包含以下信息：
+
+- 用户消息上下文
 - 决策摘要
-- 草稿片段
+- 稿件摘录
 - 模型问题
 - 模型建议
-- 人工动作（approve / edit / reject）
+- 人工动作
 
-## Export
+## 存储位置
 
-- `GET /api/v1/decision-records`
-- `GET /api/v1/threads/{thread_id}/decision-records`
-- `GET /api/v1/decision-model/status`
+- API 导出：
+  - `GET /api/v1/decision-records`
+  - `GET /api/v1/threads/{thread_id}/decision-records`
+  - `GET /api/v1/decision-model/status`
+- 本地数据：
+  - `data/decision_model/decision_records.jsonl`
 
-也可以先把运行中的记录导出到本地 JSONL，再执行：
+## 运维命令
+
+### 导出数据集
 
 ```bash
 python scripts/decision_model/export_decision_dataset.py
 ```
 
-## Train
-
-当前训练脚手架使用 Hugging Face 官方 `transformers.Trainer`：
+### 训练脚手架
 
 ```bash
 python scripts/decision_model/train_decision_model.py
 ```
 
-基模型默认使用：
+当前默认基模型：
 
 - `distilbert-base-multilingual-cased`
 
-## Predict
+### 预测验证
 
 ```bash
 echo '{"text":"..."}' | python scripts/decision_model/predict_decision.py
 ```
 
-## Important Note
+## 运维边界
 
-这只是“准备好决策模型训练链路”，不是自动学习。
-如果要真正持续学习，还需要：
-
-- 更稳定的训练样本沉淀
-- 周期性评估
-- 模型版本管理
-- 人工验收
-
-## Data Persistence
-
-人工审核记录会自动追加到：
-
-- `data/decision_model/decision_records.jsonl`
-
-因此后端重启后，训练样本不会因为内存线程丢失而消失。
+- 该链路属于离线运维能力
+- 它不应被描述为当前生产生成链路的一部分
+- 训练结果接入在线决策前，必须补齐评估、版本管理和回滚机制

@@ -1,5 +1,7 @@
 # Doc Style Guide
 
+> 历史参考。当前文档收敛以 `docs/product/`、`docs/architecture/`、`docs/operations/` 的分层为准。
+
 ## Structure
 - 开头先写 `Summary` 或 `结论`。
 - 先讲边界，再讲数据流，再讲风险。

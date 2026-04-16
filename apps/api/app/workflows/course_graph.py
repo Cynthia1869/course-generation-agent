@@ -4,7 +4,6 @@ import asyncio
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
@@ -15,6 +14,7 @@ from app.audit.logger import AuditService, EventBroker
 from app.core.schemas import (
     AuditEvent,
     ConstraintKind,
+    ConfirmedArtifactContext,
     ConversationConstraint,
     DecisionItem,
     DraftArtifact,
@@ -23,8 +23,10 @@ from app.core.schemas import (
     GenerationRunStatus,
     GenerationSessionState,
     InterruptPayload,
+    LLMProviderConfig,
     MessageRecord,
     MessageRole,
+    PromptContextLayers,
     RequirementSlot,
     ResumePayload,
     ReviewBatch,
@@ -33,6 +35,8 @@ from app.core.schemas import (
     SavedArtifactRecord,
     StepArtifactRecord,
     StepArtifactStatus,
+    StepStructuredInput,
+    StepStructuredSlot,
     StepStatus,
     ThreadHistoryEntry,
     ThreadState,
@@ -92,13 +96,20 @@ class CourseGraph:
             return
         except Exception as exc:  # noqa: BLE001
             await self.broker.publish(thread_id, {"type": "thread_failed", "thread_id": thread_id, "payload": {"error": str(exc)}})
+            state = None
+            try:
+                state = await self.store.get_thread(thread_id)
+            except Exception:
+                state = None
             await self.audit.record(
                 AuditEvent(
                     thread_id=thread_id,
+                    step_id=state.current_step_id if state else None,
+                    action_type="workflow",
                     event_type="THREAD_FAILED",
                     status="error",
                     error_code=type(exc).__name__,
-                    payload_summary={"error": str(exc)},
+                    payload_summary={"error": str(exc), "step_id": state.current_step_id if state else None},
                 )
             )
             raise
@@ -186,23 +197,47 @@ class CourseGraph:
             return ThreadState.model_validate(raw_state["state"])
         return await self.store.get_thread(raw_state["thread_id"])
 
-    async def _save_state(self, state: ThreadState, node_name: str, event_type: str, payload_summary: dict[str, Any]) -> dict[str, Any]:
+    async def _save_state(
+        self,
+        state: ThreadState,
+        node_name: str,
+        event_type: str,
+        payload_summary: dict[str, Any],
+        *,
+        model_config: LLMProviderConfig | None = None,
+        prompt_id: str | None = None,
+    ) -> dict[str, Any]:
+        event_payload = dict(payload_summary)
+        if prompt_id is not None:
+            event_payload["prompt_id"] = prompt_id
+        if model_config is not None:
+            event_payload["profile_name"] = next(
+                (name for name in ("chat", "clarify", "extract", "generate", "review", "improve") if self.deepseek.get_profile(name) == model_config),
+                None,
+            )
         await self.store.save_thread(state)
         await self.audit.record(
             AuditEvent(
                 thread_id=state.thread_id,
                 user_id=state.user_id,
                 node_name=node_name,
+                step_id=state.current_step_id,
+                action_type=node_name,
+                prompt_id=prompt_id,
+                review_batch_id=event_payload.get("review_batch_id"),
+                profile_name=event_payload.get("profile_name"),
                 event_type=event_type,
                 artifact_version=state.draft_artifact.version if state.draft_artifact else None,
-                payload_summary=payload_summary,
+                model_provider=model_config.provider if model_config else None,
+                model_name=model_config.model if model_config else None,
+                payload_summary=event_payload,
             )
         )
         await self.broker.publish(
             state.thread_id,
-            {"type": "node_update", "thread_id": state.thread_id, "payload": {"node_name": node_name, "status": state.status, **payload_summary}},
+            {"type": "node_update", "thread_id": state.thread_id, "payload": {"node_name": node_name, "status": state.status, **event_payload}},
         )
-        return {"thread_id": state.thread_id, "state": state.model_dump(mode="json"), **payload_summary}
+        return {"thread_id": state.thread_id, "state": state.model_dump(mode="json"), **event_payload}
 
     def _current_step(self, state: ThreadState) -> StepBlueprint:
         return get_step_blueprint(state.current_step_id)
@@ -212,10 +247,6 @@ class CourseGraph:
 
     def _current_step_artifact(self, state: ThreadState) -> StepArtifactRecord | None:
         return next((item for item in state.step_artifacts if item.step_id == state.current_step_id), None)
-
-    def _constraint_summary(self, state: ThreadState) -> str:
-        active = [item.instruction for item in state.conversation_constraints if item.active]
-        return "\n".join(f"- {item}" for item in active) if active else "无额外约束"
 
     def _start_generation_session(self, state: ThreadState, *, step: StepBlueprint, kind: GenerationRunKind, source_version: int | None = None, revision_goal: str | None = None) -> GenerationSessionState:
         session = GenerationSessionState(step_id=step.step_id, kind=kind, source_version=source_version, revision_goal=revision_goal)
@@ -227,14 +258,27 @@ class CourseGraph:
             state.runtime.generation_session = GenerationSessionState(step_id=state.current_step_id)
         return state.runtime.generation_session
 
-    def _start_run(self, state: ThreadState, *, kind: GenerationRunKind, instruction: str | None = None, source_version: int | None = None) -> GenerationRun:
+    def _start_run(
+        self,
+        state: ThreadState,
+        *,
+        kind: GenerationRunKind,
+        instruction: str | None = None,
+        source_version: int | None = None,
+        profile_name: str,
+        prompt_id: str,
+        action_type: str,
+    ) -> GenerationRun:
+        model_config = self.deepseek.get_profile(profile_name)
         run = GenerationRun(
             kind=kind,
             instruction=instruction,
             source_version=source_version,
-            model_provider=self.deepseek.profile.chat.provider,
-            model_name=self.deepseek.profile.chat.model,
-            metadata={"step_id": state.current_step_id},
+            profile_name=profile_name,
+            model_provider=model_config.provider,
+            model_name=model_config.model,
+            prompt_id=prompt_id,
+            metadata={"step_id": state.current_step_id, "action_type": action_type},
         )
         state.generation_runs.append(run)
         self._session(state).active_generation_run_id = run.run_id
@@ -273,27 +317,48 @@ class CourseGraph:
         if not violations:
             return markdown
         instruction = "当前稿件仍然出现被禁止内容：" + "、".join(violations) + "。必须完全移除这些内容，并替换成不同案例或表达，不能保留原词。"
+        context_layers = await self._build_prompt_context_layers(state, self._current_step(state))
         return await self.deepseek.improve_markdown(
+            prompt_id=self._current_step(state).improve_prompt_id or "improve.step_artifact",
             markdown=markdown,
             approved_changes=[instruction],
-            context_summary=state.decision_summary,
-            constraint_summary=self._constraint_summary(state),
+            structured_inputs=self._structured_inputs_text(context_layers.structured_input),
+            confirmed_artifacts=self._confirmed_artifacts_text(context_layers.confirmed_artifacts),
+            source_summary=context_layers.upload_summary,
             source_version=state.draft_artifact.version if state.draft_artifact else None,
             revision_goal=revision_goal,
             step_label=self._current_step(state).label,
-            prior_step_artifacts=self._prior_step_artifacts_summary(state, self._current_step(state)),
+            step_scope=self._step_scope(self._current_step(state)),
         )
 
     async def _timeline(self, thread_id: str, event_type: str, title: str, detail: str | None = None, payload: dict[str, Any] | None = None) -> None:
         await self.store.append_timeline_event(TimelineEvent(thread_id=thread_id, event_type=event_type, title=title, detail=detail, payload=payload or {}))
 
-    def _slot_summary_for_step(self, state: ThreadState, step: StepBlueprint) -> str:
-        lines: list[str] = []
+    def _build_structured_input(self, state: ThreadState, step: StepBlueprint) -> StepStructuredInput:
+        slots: list[StepStructuredSlot] = []
         for slot_id in [*step.required_slots, *step.optional_slots]:
             slot = state.requirement_slots.get(slot_id)
             if slot and slot.value:
-                lines.append(f"{slot.label}: {slot.value}")
-        return "\n".join(lines) or "暂无"
+                slots.append(
+                    StepStructuredSlot(
+                        slot_id=slot.slot_id,
+                        label=slot.label,
+                        value=slot.value,
+                        required=slot_id in step.required_slots,
+                        confirmed=slot.confirmed,
+                        source=slot.source,
+                    )
+                )
+        return StepStructuredInput(step_id=step.step_id, step_label=step.label, slots=slots)
+
+    def _structured_inputs_text(self, structured_input: StepStructuredInput) -> str:
+        if not structured_input.slots:
+            return "暂无当前步骤结构化输入"
+        lines = []
+        for slot in structured_input.slots:
+            prefix = "必填" if slot.required else "可选"
+            lines.append(f"- {prefix} | {slot.label}: {slot.value}")
+        return "\n".join(lines)
 
     def _serialize_requirement_defs(self, step: StepBlueprint) -> list[dict[str, str]]:
         defs = []
@@ -311,18 +376,63 @@ class CourseGraph:
                 missing.append({"slot_id": slot_id, "label": slot_def.label, "prompt_hint": slot_def.prompt_hint})
         return missing
 
-    def _prior_step_artifacts_summary(self, state: ThreadState, step: StepBlueprint) -> str:
-        chunks: list[str] = []
+    async def _confirmed_prior_step_artifacts(self, state: ThreadState, step: StepBlueprint) -> list[ConfirmedArtifactContext]:
+        artifacts: list[ConfirmedArtifactContext] = []
         for prerequisite in step.prerequisite_step_ids:
-            record = next((item for item in state.saved_artifacts if item.step_id == prerequisite and item.kind == "generated"), None)
-            if not record:
+            record = next((item for item in state.step_artifacts if item.step_id == prerequisite), None)
+            if record is None or record.confirmed_version is None:
                 continue
             try:
-                content = Path(record.path).read_text(encoding="utf-8")
-            except Exception:
+                detail = await self.store.get_artifact_version(state.thread_id, record.confirmed_version)
+            except KeyError:
                 continue
-            chunks.append(f"## {record.label}\n{content[:2000]}")
-        return "\n\n".join(chunks) or "暂无"
+            artifacts.append(
+                ConfirmedArtifactContext(
+                    step_id=prerequisite,
+                    step_label=record.label,
+                    version=record.confirmed_version,
+                    markdown=detail.markdown,
+                )
+            )
+        return artifacts
+
+    def _confirmed_artifacts_text(self, artifacts: list[ConfirmedArtifactContext]) -> str:
+        if not artifacts:
+            return "暂无已确认前序产物"
+        return "\n\n".join(f"## {item.step_label} (v{item.version})\n{item.markdown[:2000]}" for item in artifacts)
+
+    def _upload_summary(self, state: ThreadState) -> str:
+        source_summary = []
+        for document in state.source_manifest:
+            if document.extract_status != "parsed":
+                continue
+            if document.metadata.get("category") != "context":
+                continue
+            preview = " ".join(chunk.text for chunk in document.text_chunks[:2])
+            source_summary.append(f"{document.filename}: {preview[:200]}")
+        return "\n".join(source_summary) or "无上传资料"
+
+    def _step_scope(self, step: StepBlueprint) -> str:
+        prior = "、".join(step.prerequisite_step_ids) if step.prerequisite_step_ids else "无前序步骤"
+        forbidden = "、".join(step.forbidden_topics) if step.forbidden_topics else "无显式禁区"
+        return f"当前步骤是“{step.label}”。允许依赖当前步骤结构化输入、已确认的前序步骤产物和上传资料摘要；前序范围：{prior}；禁止提前展开：{forbidden}。"
+
+    def _output_contract(self, step: StepBlueprint, purpose: str) -> str:
+        mapping = {
+            "clarify": f"只追问“{step.label}”当前缺失的一个字段。",
+            "generate": f"只生成“{step.label}”正式草稿，不提前产出其他步骤内容。",
+            "review": f"只评审“{step.label}”当前版本，不把未来步骤当成扣分项。",
+            "improve": f"只修订“{step.label}”当前版本，不改写前序已确认产物。",
+        }
+        return mapping[purpose]
+
+    async def _build_prompt_context_layers(self, state: ThreadState, step: StepBlueprint) -> PromptContextLayers:
+        return PromptContextLayers(
+            raw_session_messages=list(state.messages),
+            structured_input=self._build_structured_input(state, step),
+            confirmed_artifacts=await self._confirmed_prior_step_artifacts(state, step),
+            upload_summary=self._upload_summary(state),
+        )
 
     async def _persist_current_step_artifact(self, state: ThreadState) -> SavedArtifactRecord | None:
         if state.draft_artifact is None:
@@ -376,7 +486,26 @@ class CourseGraph:
         state = await self._load_state(raw_state)
         step = self._current_step(state)
         latest_user_message = next((m.content for m in reversed(state.messages) if m.role == MessageRole.USER), "")
-        current_values = {slot_id: slot.value for slot_id, slot in state.requirement_slots.items() if slot.value}
+        if state.runtime.pending_manual_revision_request and state.draft_artifact is not None and state.draft_artifact.step_id == step.step_id:
+            state.runtime.clarification.missing_requirements = []
+            state.runtime.clarification.next_requirement_to_clarify = None
+            state.runtime.clarification.slot_summary = self._structured_inputs_text(self._build_structured_input(state, step))
+            state.runtime.clarification.latest_user_message = latest_user_message
+            state.runtime.clarification.is_confirmation_reply = False
+            return await self._save_state(
+                state,
+                "requirement_gap_check",
+                "GRAPH_NODE_COMPLETED",
+                {"step_id": step.step_id, "missing_requirements": [], "mode": "manual_feedback"},
+                model_config=self.deepseek.get_profile("extract"),
+                prompt_id="extract.requirements",
+            )
+
+        current_values = {
+            slot_id: slot.value
+            for slot_id, slot in state.requirement_slots.items()
+            if slot.value and slot_id in {*step.required_slots, *step.optional_slots}
+        }
         requirement_defs = self._serialize_requirement_defs(step)
         extracted = await self.deepseek.extract_requirements(
             latest_user_message=latest_user_message,
@@ -405,7 +534,7 @@ class CourseGraph:
         missing = self._missing_required_slots(state, step)
         state.runtime.clarification.missing_requirements = missing
         state.runtime.clarification.next_requirement_to_clarify = missing[0]["slot_id"] if missing else None
-        state.runtime.clarification.slot_summary = self._slot_summary_for_step(state, step)
+        state.runtime.clarification.slot_summary = self._structured_inputs_text(self._build_structured_input(state, step))
         state.runtime.clarification.latest_user_message = latest_user_message
         state.runtime.clarification.is_confirmation_reply = bool(latest_user_message and any(re.search(pattern, latest_user_message.strip()) for pattern in CONFIRMATION_PATTERNS))
         return await self._save_state(
@@ -413,6 +542,8 @@ class CourseGraph:
             "requirement_gap_check",
             "GRAPH_NODE_COMPLETED",
             {"step_id": step.step_id, "missing_requirements": [item["slot_id"] for item in missing]},
+            model_config=self.deepseek.get_profile("extract"),
+            prompt_id="extract.requirements",
         )
 
     def route_after_gap_check(self, raw_state: dict[str, Any]) -> str:
@@ -428,6 +559,7 @@ class CourseGraph:
     async def clarify_question(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
         step = self._current_step(state)
+        context_layers = await self._build_prompt_context_layers(state, step)
         missing_slot_id = state.runtime.clarification.next_requirement_to_clarify
         missing_requirement = next((item for item in state.runtime.clarification.missing_requirements if item["slot_id"] == missing_slot_id), None)
         if missing_requirement is None:
@@ -436,11 +568,15 @@ class CourseGraph:
         await self.broker.publish(state.thread_id, {"type": "clarification_started", "thread_id": state.thread_id, "payload": {"slot_id": missing_slot_id, "step_id": step.step_id}})
         async for chunk in self.deepseek.stream_clarification(
             {
-                "prompt_id": f"clarify.{step.step_id}",
+                "prompt_id": step.clarify_prompt_id or f"clarify.{step.step_id}",
                 "step_label": step.label,
+                "step_scope": self._step_scope(step),
+                "allowed_input_layers": "当前步骤结构化输入、上传资料摘要",
+                "forbidden_input_layers": "原始聊天消息、未来步骤内容、未确认产物",
+                "output_contract": self._output_contract(step, "clarify"),
                 "allowed_scope": "、".join([SLOT_DEFINITIONS[item].label for item in [*step.required_slots, *step.optional_slots]]) or "无",
                 "forbidden_scope": "、".join(step.forbidden_topics) or "无",
-                "slot_summary": state.runtime.clarification.slot_summary,
+                "structured_inputs": self._structured_inputs_text(context_layers.structured_input),
                 "missing_requirement": missing_requirement,
             }
         ):
@@ -451,7 +587,14 @@ class CourseGraph:
         await self.broker.publish(state.thread_id, {"type": "assistant_stream_end", "thread_id": state.thread_id, "payload": {"content": question}})
         await self.broker.publish(state.thread_id, {"type": "clarification_completed", "thread_id": state.thread_id, "payload": {"content": question}})
         await self._timeline(state.thread_id, "clarification_completed", f"{step.label}缺失项追问已发出", detail=question[:160], payload={"step_id": step.step_id})
-        return await self._save_state(state, "clarify_question", "CLARIFICATION_REQUESTED", {"question": question[:160], "step_id": step.step_id})
+        return await self._save_state(
+            state,
+            "clarify_question",
+            "CLARIFICATION_REQUESTED",
+            {"question": question[:160], "step_id": step.step_id},
+            model_config=self.deepseek.get_profile("clarify"),
+            prompt_id=step.clarify_prompt_id or f"clarify.{step.step_id}",
+        )
 
     async def confirm_requirements(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
@@ -481,43 +624,47 @@ class CourseGraph:
                     if normalized and not any(item.normalized_instruction == normalized for item in state.conversation_constraints):
                         state.conversation_constraints.append(ConversationConstraint(kind=ConstraintKind.REQUIRE, instruction=slot.value, normalized_instruction=normalized))
         state.decision_summary = "\n".join(f"{item.topic}: {item.value}" for item in state.decision_ledger)
+        state.requirements_confirmed = True
         await self._timeline(state.thread_id, "requirements_confirmed", f"{step.label}需求已确认", payload={"decision_count": len(state.decision_ledger), "step_id": step.step_id})
         return await self._save_state(state, "decision_update", "DECISION_CONFIRMED", {"decision_count": len(state.decision_ledger), "step_id": step.step_id})
 
     async def source_parse(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
         session = self._session(state)
-        source_summary = []
-        for document in state.source_manifest:
-            if document.extract_status == "parsed":
-                preview = " ".join(chunk.text for chunk in document.text_chunks[:2])
-                source_summary.append(f"{document.filename}: {preview[:200]}")
-        session.source_summary = "\n".join(source_summary) or "无上传资料"
+        session.source_summary = self._upload_summary(state)
         return await self._save_state(state, "source_parse", "GRAPH_NODE_COMPLETED", {"source_count": len(state.source_manifest), "step_id": state.current_step_id})
 
     async def generate_step_artifact(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
         step = self._current_step(state)
+        context_layers = await self._build_prompt_context_layers(state, step)
         session = self._start_generation_session(state, step=step, kind=GenerationRunKind.GENERATION, revision_goal=step.generation_goal)
         state.status = ThreadStatus.GENERATING
         session.generated_markdown = ""
-        state.draft_artifact = DraftArtifact(version=0, markdown="", summary=f"{step.label}生成中...")
-        run = self._start_run(state, kind=GenerationRunKind.GENERATION, instruction=step.generation_goal)
+        state.draft_artifact = DraftArtifact(step_id=step.step_id, version=0, markdown="", summary=f"{step.label}生成中...")
+        run = self._start_run(
+            state,
+            kind=GenerationRunKind.GENERATION,
+            instruction=step.generation_goal,
+            profile_name="generate",
+            prompt_id=step.generate_prompt_id or "generate.legacy_full_draft",
+            action_type="generate",
+        )
         await self.broker.publish(state.thread_id, {"type": "generation_started", "thread_id": state.thread_id, "payload": {"run_id": run.run_id, "step_id": step.step_id}})
         await self._timeline(state.thread_id, "generation_started", f"开始生成{step.label}", payload={"run_id": run.run_id, "step_id": step.step_id})
 
         async for chunk in self.deepseek.stream_step_markdown(
             {
-                "prompt_id": step.prompt_id,
+                "prompt_id": step.generate_prompt_id,
                 "step_label": step.label,
+                "step_scope": self._step_scope(step),
+                "allowed_input_layers": "当前步骤结构化输入、已确认前序产物、上传资料摘要",
+                "forbidden_input_layers": "原始聊天消息、未来步骤内容、未确认产物、reasoning 内容",
+                "output_contract": self._output_contract(step, "generate"),
                 "generation_goal": step.generation_goal,
-                "required_slots": "\n".join(f"- {SLOT_DEFINITIONS[slot_id].label}" for slot_id in step.required_slots),
-                "optional_slots": "\n".join(f"- {SLOT_DEFINITIONS[slot_id].label}" for slot_id in step.optional_slots) or "无",
-                "forbidden_topics": "\n".join(f"- {topic}" for topic in step.forbidden_topics) or "无",
-                "slot_summary": self._slot_summary_for_step(state, step),
-                "source_summary": session.source_summary,
-                "prior_step_artifacts": self._prior_step_artifacts_summary(state, step),
-                "constraint_summary": self._constraint_summary(state),
+                "structured_inputs": self._structured_inputs_text(context_layers.structured_input),
+                "confirmed_artifacts": self._confirmed_artifacts_text(context_layers.confirmed_artifacts),
+                "source_summary": context_layers.upload_summary,
             }
         ):
             session.generated_markdown += chunk
@@ -526,6 +673,7 @@ class CourseGraph:
         session.generated_markdown = await self._enforce_markdown_constraints(state, session.generated_markdown, step.generation_goal)
         next_version = max([item.version for item in await self.store.list_versions(state.thread_id)], default=0) + 1
         artifact = DraftArtifact(
+            step_id=step.step_id,
             version=next_version,
             markdown=session.generated_markdown,
             summary=f"{step.label}已生成。",
@@ -534,7 +682,7 @@ class CourseGraph:
             generation_run_id=session.active_generation_run_id,
         )
         state.draft_artifact = artifact
-        state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, source_version=artifact.source_version, revision_goal=artifact.revision_goal, generation_run_id=artifact.generation_run_id))
+        state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, step_id=step.step_id, source_version=artifact.source_version, revision_goal=artifact.revision_goal, generation_run_id=artifact.generation_run_id))
         await self.store.upsert_artifact_version(state.thread_id, artifact)
         await self._persist_current_step_artifact(state)
         self._sync_current_step_artifact_state(state)
@@ -542,16 +690,29 @@ class CourseGraph:
         await self.broker.publish(state.thread_id, {"type": "artifact_updated", "thread_id": state.thread_id, "payload": artifact.model_dump(mode="json")})
         await self.broker.publish(state.thread_id, {"type": "generation_completed", "thread_id": state.thread_id, "payload": {"version": artifact.version, "step_id": step.step_id}})
         await self._timeline(state.thread_id, "generation_completed", f"{step.label}已生成", payload={"version": artifact.version, "step_id": step.step_id})
-        return await self._save_state(state, "generate_step_artifact", "DRAFT_GENERATED", {"artifact_version": artifact.version, "step_id": step.step_id})
+        return await self._save_state(
+            state,
+            "generate_step_artifact",
+            "DRAFT_GENERATED",
+            {"artifact_version": artifact.version, "step_id": step.step_id},
+            model_config=self.deepseek.get_profile("generate"),
+            prompt_id=step.generate_prompt_id,
+        )
 
     async def critique_score(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
         step = self._current_step(state)
         state.status = ThreadStatus.REVIEW_PENDING
         result = await self.deepseek.review_markdown(
+            prompt_id=step.review_prompt_id or "review.step_artifact",
             markdown=state.draft_artifact.markdown,
             rubric=RUBRIC,
             threshold=self.settings.default_review_threshold,
+            step_label=step.label,
+            step_scope=self._step_scope(step),
+            allowed_input_layers="当前步骤结构化输入、已确认前序产物、上传资料摘要、当前步骤产物",
+            forbidden_input_layers="未来步骤内容、未确认产物、reasoning 内容、原始聊天消息",
+            forbidden_topics="、".join(step.forbidden_topics) or "无",
         )
         batch = ReviewBatch(
             step_id=step.step_id,
@@ -568,7 +729,14 @@ class CourseGraph:
         await self.broker.publish(state.thread_id, {"type": "review_batch", "thread_id": state.thread_id, "payload": batch.model_dump(mode="json")})
         await self.broker.publish(state.thread_id, {"type": "review_ready", "thread_id": state.thread_id, "payload": batch.model_dump(mode="json")})
         await self._timeline(state.thread_id, "review_ready", f"{step.label}评审建议已生成", payload={"review_batch_id": batch.review_batch_id, "score": batch.total_score, "step_id": step.step_id})
-        return await self._save_state(state, "critique_score", "REVIEW_BATCH_CREATED", {"review_batch_id": batch.review_batch_id, "score": batch.total_score, "step_id": step.step_id})
+        return await self._save_state(
+            state,
+            "critique_score",
+            "REVIEW_BATCH_CREATED",
+            {"review_batch_id": batch.review_batch_id, "score": batch.total_score, "step_id": step.step_id},
+            model_config=self.deepseek.get_profile("review"),
+            prompt_id=step.review_prompt_id or "review.step_artifact",
+        )
 
     def route_after_critique_score(self, raw_state: dict[str, Any]) -> str:
         state = ThreadState.model_validate(raw_state["state"])
@@ -582,23 +750,35 @@ class CourseGraph:
         state = await self._load_state(raw_state)
         step = self._current_step(state)
         latest_review = state.review_batches[-1]
+        context_layers = await self._build_prompt_context_layers(state, step)
         state.status = ThreadStatus.REVISING
         session = self._session(state)
         session.auto_optimization_loops += 1
         session.source_version = state.draft_artifact.version if state.draft_artifact else None
         session.revision_goal = f"根据自动评审建议补强{step.label}"
-        self._start_run(state, kind=GenerationRunKind.REVISION, instruction=session.revision_goal, source_version=session.source_version)
+        self._start_run(
+            state,
+            kind=GenerationRunKind.REVISION,
+            instruction=session.revision_goal,
+            source_version=session.source_version,
+            profile_name="improve",
+            prompt_id=step.improve_prompt_id or "improve.step_artifact",
+            action_type="auto_improve",
+        )
         session.generated_markdown = await self.deepseek.improve_markdown(
+            prompt_id=step.improve_prompt_id or "improve.step_artifact",
             markdown=state.draft_artifact.markdown,
             approved_changes=[suggestion.suggestion for suggestion in latest_review.suggestions],
-            context_summary=state.decision_summary,
-            constraint_summary=self._constraint_summary(state),
+            structured_inputs=self._structured_inputs_text(context_layers.structured_input),
+            confirmed_artifacts=self._confirmed_artifacts_text(context_layers.confirmed_artifacts),
+            source_summary=context_layers.upload_summary,
             source_version=session.source_version,
             revision_goal=session.revision_goal,
             step_label=step.label,
-            prior_step_artifacts=self._prior_step_artifacts_summary(state, step),
+            step_scope=self._step_scope(step),
         )
         artifact = DraftArtifact(
+            step_id=step.step_id,
             version=(state.draft_artifact.version + 1),
             markdown=session.generated_markdown,
             summary=f"{step.label}自动优化版本。",
@@ -607,13 +787,20 @@ class CourseGraph:
             generation_run_id=session.active_generation_run_id,
         )
         state.draft_artifact = artifact
-        state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, source_version=artifact.source_version, revision_goal=artifact.revision_goal, generation_run_id=artifact.generation_run_id))
+        state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, step_id=step.step_id, source_version=artifact.source_version, revision_goal=artifact.revision_goal, generation_run_id=artifact.generation_run_id))
         await self.store.upsert_artifact_version(state.thread_id, artifact)
         await self._persist_current_step_artifact(state)
         self._sync_current_step_artifact_state(state)
         self._complete_run(state, target_version=artifact.version, preview=artifact.markdown)
         await self.broker.publish(state.thread_id, {"type": "revision_started", "thread_id": state.thread_id, "payload": {"loop": session.auto_optimization_loops, "step_id": step.step_id}})
-        return await self._save_state(state, "auto_improve", "DRAFT_REVISED", {"mode": "auto", "loop": session.auto_optimization_loops, "step_id": step.step_id})
+        return await self._save_state(
+            state,
+            "auto_improve",
+            "DRAFT_REVISED",
+            {"mode": "auto", "loop": session.auto_optimization_loops, "step_id": step.step_id},
+            model_config=self.deepseek.get_profile("improve"),
+            prompt_id=step.improve_prompt_id or "improve.step_artifact",
+        )
 
     async def human_review_interrupt(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
@@ -635,23 +822,35 @@ class CourseGraph:
     async def revise_step_artifact(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
         step = self._current_step(state)
+        context_layers = await self._build_prompt_context_layers(state, step)
         instructions = [action.edited_suggestion or f"根据人工确认意见补强{step.label}。" for action in state.approved_feedback if action.action != "reject"]
         if not instructions:
             return await self._save_state(state, "revise_step_artifact", "GRAPH_NODE_SKIPPED", {"reason": "no_approved_feedback", "step_id": step.step_id, "revised": False})
         session = self._start_generation_session(state, step=step, kind=GenerationRunKind.REVISION, source_version=state.draft_artifact.version if state.draft_artifact else None, revision_goal=f"根据人工审核意见补强{step.label}")
-        self._start_run(state, kind=GenerationRunKind.REVISION, instruction=session.revision_goal, source_version=session.source_version)
+        self._start_run(
+            state,
+            kind=GenerationRunKind.REVISION,
+            instruction=session.revision_goal,
+            source_version=session.source_version,
+            profile_name="improve",
+            prompt_id=step.improve_prompt_id or "improve.step_artifact",
+            action_type="revise",
+        )
         state.status = ThreadStatus.REVISING
         session.generated_markdown = await self.deepseek.improve_markdown(
+            prompt_id=step.improve_prompt_id or "improve.step_artifact",
             markdown=state.draft_artifact.markdown,
             approved_changes=instructions,
-            context_summary=state.decision_summary,
-            constraint_summary=self._constraint_summary(state),
+            structured_inputs=self._structured_inputs_text(context_layers.structured_input),
+            confirmed_artifacts=self._confirmed_artifacts_text(context_layers.confirmed_artifacts),
+            source_summary=context_layers.upload_summary,
             source_version=session.source_version,
             revision_goal=session.revision_goal,
             step_label=step.label,
-            prior_step_artifacts=self._prior_step_artifacts_summary(state, step),
+            step_scope=self._step_scope(step),
         )
         artifact = DraftArtifact(
+            step_id=step.step_id,
             version=(state.draft_artifact.version + 1),
             markdown=session.generated_markdown,
             summary=f"{step.label}人工修订版本。",
@@ -660,34 +859,53 @@ class CourseGraph:
             generation_run_id=session.active_generation_run_id,
         )
         state.draft_artifact = artifact
-        state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, source_version=artifact.source_version, revision_goal=artifact.revision_goal, generation_run_id=artifact.generation_run_id))
+        state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, step_id=step.step_id, source_version=artifact.source_version, revision_goal=artifact.revision_goal, generation_run_id=artifact.generation_run_id))
         await self.store.upsert_artifact_version(state.thread_id, artifact)
         await self._persist_current_step_artifact(state)
         self._sync_current_step_artifact_state(state)
         self._complete_run(state, target_version=artifact.version, preview=artifact.markdown)
         await self.broker.publish(state.thread_id, {"type": "revision_started", "thread_id": state.thread_id, "payload": {"approved_count": len(instructions), "step_id": step.step_id}})
-        return await self._save_state(state, "revise_step_artifact", "DRAFT_REVISED", {"step_id": step.step_id, "approved_count": len(instructions), "revised": True})
+        return await self._save_state(
+            state,
+            "revise_step_artifact",
+            "DRAFT_REVISED",
+            {"step_id": step.step_id, "approved_count": len(instructions), "revised": True},
+            model_config=self.deepseek.get_profile("improve"),
+            prompt_id=step.improve_prompt_id or "improve.step_artifact",
+        )
 
     async def apply_manual_feedback(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
         step = self._current_step(state)
+        context_layers = await self._build_prompt_context_layers(state, step)
         instruction = state.runtime.pending_manual_revision_request or ""
         if not instruction or state.draft_artifact is None:
             return await self._save_state(state, "apply_manual_feedback", "GRAPH_NODE_SKIPPED", {"reason": "no_manual_revision_request", "step_id": step.step_id})
         session = self._start_generation_session(state, step=step, kind=GenerationRunKind.REVISION, source_version=state.draft_artifact.version, revision_goal=instruction)
-        self._start_run(state, kind=GenerationRunKind.REVISION, instruction=instruction, source_version=state.draft_artifact.version)
+        self._start_run(
+            state,
+            kind=GenerationRunKind.REVISION,
+            instruction=instruction,
+            source_version=state.draft_artifact.version,
+            profile_name="improve",
+            prompt_id=step.improve_prompt_id or "improve.step_artifact",
+            action_type="manual_improve",
+        )
         state.status = ThreadStatus.REVISING
         session.generated_markdown = await self.deepseek.improve_markdown(
+            prompt_id=step.improve_prompt_id or "improve.step_artifact",
             markdown=state.draft_artifact.markdown,
             approved_changes=[instruction],
-            context_summary=state.decision_summary,
-            constraint_summary=self._constraint_summary(state),
+            structured_inputs=self._structured_inputs_text(context_layers.structured_input),
+            confirmed_artifacts=self._confirmed_artifacts_text(context_layers.confirmed_artifacts),
+            source_summary=context_layers.upload_summary,
             source_version=state.draft_artifact.version,
             revision_goal=instruction,
             step_label=step.label,
-            prior_step_artifacts=self._prior_step_artifacts_summary(state, step),
+            step_scope=self._step_scope(step),
         )
         artifact = DraftArtifact(
+            step_id=step.step_id,
             version=(state.draft_artifact.version + 1),
             markdown=session.generated_markdown,
             summary=f"{step.label}按用户补充意见修订。",
@@ -696,12 +914,19 @@ class CourseGraph:
             generation_run_id=session.active_generation_run_id,
         )
         state.draft_artifact = artifact
-        state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, source_version=artifact.source_version, revision_goal=artifact.revision_goal, generation_run_id=artifact.generation_run_id))
+        state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, step_id=step.step_id, source_version=artifact.source_version, revision_goal=artifact.revision_goal, generation_run_id=artifact.generation_run_id))
         await self.store.upsert_artifact_version(state.thread_id, artifact)
         await self._persist_current_step_artifact(state)
         self._complete_run(state, target_version=artifact.version, preview=artifact.markdown)
         state.runtime.pending_manual_revision_request = None
-        return await self._save_state(state, "apply_manual_feedback", "USER_FEEDBACK_APPLIED", {"instruction": instruction[:160], "step_id": step.step_id})
+        return await self._save_state(
+            state,
+            "apply_manual_feedback",
+            "USER_FEEDBACK_APPLIED",
+            {"instruction": instruction[:160], "step_id": step.step_id},
+            model_config=self.deepseek.get_profile("improve"),
+            prompt_id=step.improve_prompt_id or "improve.step_artifact",
+        )
 
     async def completion_gate(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)

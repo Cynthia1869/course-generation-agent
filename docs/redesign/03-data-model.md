@@ -1,5 +1,7 @@
 # Data Model
 
+> 历史 redesign 参考。当前版本的术语与对象解释请优先阅读 `docs/product/terminology.md` 与 `apps/api/app/core/schemas.py`。
+
 ## Core Entities
 - `ThreadState`
   - 线程聚合根，包含消息、需求槽位、约束、当前草稿、版本链、评审批次、生成运行记录和结构化 runtime state。

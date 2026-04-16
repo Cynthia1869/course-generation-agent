@@ -1,5 +1,7 @@
 # Refactor Delivery
 
+> 历史交付记录。本文档描述的是一次重构交付的阶段性结果，不是当前版本的规范文档。当前规范请以 `docs/product/`、`docs/architecture/workflow-and-gates.md`、`docs/api/http-api.md`、`docs/operations/` 为准。
+
 ## Phase Summary
 
 ### Phase 1: Architecture and Contract Baseline

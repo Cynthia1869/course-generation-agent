@@ -54,6 +54,11 @@ async def submit_review(
             status_code=404,
             detail={"code": "thread_not_found", "message": f"Thread not found: {exc.thread_id}"},
         ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "review_submit_rejected", "message": str(exc)},
+        ) from exc
     return envelope(thread_id=thread_id, data={"submitted": True, "review_batch_id": batch_id})
 
 

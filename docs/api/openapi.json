@@ -4421,7 +4421,7 @@
           "current_step_id": {
             "type": "string",
             "title": "Current Step Id",
-            "default": "step_1"
+            "default": "course_title"
           },
           "requirements_confirmed": {
             "type": "boolean",
@@ -4598,7 +4598,7 @@
           "current_step_id": {
             "type": "string",
             "title": "Current Step Id",
-            "default": "step_1"
+            "default": "course_title"
           },
           "latest_artifact_version": {
             "anyOf": [

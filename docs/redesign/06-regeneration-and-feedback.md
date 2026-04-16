@@ -1,5 +1,7 @@
 # Regeneration And Feedback
 
+> 历史 redesign 参考。当前再生成与评审边界请以 `docs/architecture/workflow-and-gates.md` 和 `docs/api/http-api.md` 为准。
+
 ## Problem
 - 旧实现只做“整篇 markdown + 单句 instruction”的粗暴改写。
 - 结果是案例经常不变、逐字稿劣化、负反馈失效。

@@ -1,4 +1,34 @@
 prompts:
+  - prompt_id: global.single_course_system
+    version: v1
+    provider: deepseek
+    mode: single
+    step_id: null
+    purpose: system
+    input_vars:
+      - step_label
+      - step_scope
+      - allowed_input_layers
+      - forbidden_input_layers
+      - output_contract
+    output_contract: single_course_system_guardrails
+    file: deepseek/system/single_course_system.md
+
+  - prompt_id: global.series_course_system
+    version: v1
+    provider: deepseek
+    mode: series
+    step_id: null
+    purpose: system
+    input_vars:
+      - step_label
+      - step_scope
+      - allowed_input_layers
+      - forbidden_input_layers
+      - output_contract
+    output_contract: series_course_system_guardrails
+    file: deepseek/system/series_course_system.md
+
   - prompt_id: extract.requirements
     version: v1
     provider: deepseek
@@ -18,11 +48,12 @@ prompts:
     mode: series
     step_id: series_framework
     purpose: clarify
+    system_prompt_id: global.series_course_system
     input_vars:
       - step_label
       - allowed_scope
       - forbidden_scope
-      - slot_summary
+      - structured_inputs
       - missing_requirements
     output_contract: single_missing_item_question
     file: deepseek/clarify/series_framework.md
@@ -33,11 +64,12 @@ prompts:
     mode: single
     step_id: course_title
     purpose: clarify
+    system_prompt_id: global.single_course_system
     input_vars:
       - step_label
       - allowed_scope
       - forbidden_scope
-      - slot_summary
+      - structured_inputs
       - missing_requirements
     output_contract: single_missing_item_question
     file: deepseek/clarify/course_title.md
@@ -48,11 +80,12 @@ prompts:
     mode: single
     step_id: course_framework
     purpose: clarify
+    system_prompt_id: global.single_course_system
     input_vars:
       - step_label
       - allowed_scope
       - forbidden_scope
-      - slot_summary
+      - structured_inputs
       - missing_requirements
     output_contract: single_missing_item_question
     file: deepseek/clarify/course_framework.md
@@ -63,11 +96,12 @@ prompts:
     mode: single
     step_id: case_output
     purpose: clarify
+    system_prompt_id: global.single_course_system
     input_vars:
       - step_label
       - allowed_scope
       - forbidden_scope
-      - slot_summary
+      - structured_inputs
       - missing_requirements
     output_contract: single_missing_item_question
     file: deepseek/clarify/case_output.md
@@ -78,11 +112,12 @@ prompts:
     mode: single
     step_id: script_output
     purpose: clarify
+    system_prompt_id: global.single_course_system
     input_vars:
       - step_label
       - allowed_scope
       - forbidden_scope
-      - slot_summary
+      - structured_inputs
       - missing_requirements
     output_contract: single_missing_item_question
     file: deepseek/clarify/script_output.md
@@ -93,11 +128,12 @@ prompts:
     mode: single
     step_id: material_checklist
     purpose: clarify
+    system_prompt_id: global.single_course_system
     input_vars:
       - step_label
       - allowed_scope
       - forbidden_scope
-      - slot_summary
+      - structured_inputs
       - missing_requirements
     output_contract: single_missing_item_question
     file: deepseek/clarify/material_checklist.md
@@ -123,16 +159,13 @@ prompts:
     mode: series
     step_id: series_framework
     purpose: generate
+    system_prompt_id: global.series_course_system
     input_vars:
       - step_label
       - generation_goal
-      - required_slots
-      - optional_slots
-      - forbidden_topics
-      - slot_summary
+      - structured_inputs
+      - confirmed_artifacts
       - source_summary
-      - prior_step_artifacts
-      - constraint_summary
     output_contract: series_framework_markdown
     file: deepseek/generate/series_framework.md
 
@@ -142,16 +175,13 @@ prompts:
     mode: single
     step_id: course_title
     purpose: generate
+    system_prompt_id: global.single_course_system
     input_vars:
       - step_label
       - generation_goal
-      - required_slots
-      - optional_slots
-      - forbidden_topics
-      - slot_summary
+      - structured_inputs
+      - confirmed_artifacts
       - source_summary
-      - prior_step_artifacts
-      - constraint_summary
     output_contract: course_title_markdown
     file: deepseek/generate/course_title.md
 
@@ -161,16 +191,13 @@ prompts:
     mode: single
     step_id: course_framework
     purpose: generate
+    system_prompt_id: global.single_course_system
     input_vars:
       - step_label
       - generation_goal
-      - required_slots
-      - optional_slots
-      - forbidden_topics
-      - slot_summary
+      - structured_inputs
+      - confirmed_artifacts
       - source_summary
-      - prior_step_artifacts
-      - constraint_summary
     output_contract: course_framework_markdown
     file: deepseek/generate/course_framework.md
 
@@ -180,16 +207,13 @@ prompts:
     mode: single
     step_id: case_output
     purpose: generate
+    system_prompt_id: global.single_course_system
     input_vars:
       - step_label
       - generation_goal
-      - required_slots
-      - optional_slots
-      - forbidden_topics
-      - slot_summary
+      - structured_inputs
+      - confirmed_artifacts
       - source_summary
-      - prior_step_artifacts
-      - constraint_summary
     output_contract: case_output_markdown
     file: deepseek/generate/case_output.md
 
@@ -199,16 +223,13 @@ prompts:
     mode: single
     step_id: script_output
     purpose: generate
+    system_prompt_id: global.single_course_system
     input_vars:
       - step_label
       - generation_goal
-      - required_slots
-      - optional_slots
-      - forbidden_topics
-      - slot_summary
+      - structured_inputs
+      - confirmed_artifacts
       - source_summary
-      - prior_step_artifacts
-      - constraint_summary
     output_contract: script_output_markdown
     file: deepseek/generate/script_output.md
 
@@ -218,16 +239,13 @@ prompts:
     mode: single
     step_id: material_checklist
     purpose: generate
+    system_prompt_id: global.single_course_system
     input_vars:
       - step_label
       - generation_goal
-      - required_slots
-      - optional_slots
-      - forbidden_topics
-      - slot_summary
+      - structured_inputs
+      - confirmed_artifacts
       - source_summary
-      - prior_step_artifacts
-      - constraint_summary
     output_contract: material_checklist_markdown
     file: deepseek/generate/material_checklist.md
 
@@ -246,6 +264,102 @@ prompts:
     output_contract: structured_review_json
     file: deepseek/review/step_artifact.md
 
+  - prompt_id: review.series_framework
+    version: v1
+    provider: deepseek
+    mode: series
+    step_id: series_framework
+    purpose: review
+    system_prompt_id: global.series_course_system
+    input_vars:
+      - step_label
+      - threshold
+      - rubric_text
+      - markdown
+      - forbidden_topics
+    output_contract: structured_review_json
+    file: deepseek/review/step_artifact.md
+
+  - prompt_id: review.course_title
+    version: v1
+    provider: deepseek
+    mode: single
+    step_id: course_title
+    purpose: review
+    system_prompt_id: global.single_course_system
+    input_vars:
+      - step_label
+      - threshold
+      - rubric_text
+      - markdown
+      - forbidden_topics
+    output_contract: structured_review_json
+    file: deepseek/review/step_artifact.md
+
+  - prompt_id: review.course_framework
+    version: v1
+    provider: deepseek
+    mode: single
+    step_id: course_framework
+    purpose: review
+    system_prompt_id: global.single_course_system
+    input_vars:
+      - step_label
+      - threshold
+      - rubric_text
+      - markdown
+      - forbidden_topics
+    output_contract: structured_review_json
+    file: deepseek/review/step_artifact.md
+
+  - prompt_id: review.case_output
+    version: v1
+    provider: deepseek
+    mode: single
+    step_id: case_output
+    purpose: review
+    system_prompt_id: global.single_course_system
+    input_vars:
+      - step_label
+      - threshold
+      - rubric_text
+      - markdown
+      - forbidden_topics
+    output_contract: structured_review_json
+    file: deepseek/review/step_artifact.md
+
+  - prompt_id: review.script_output
+    version: v1
+    provider: deepseek
+    mode: single
+    step_id: script_output
+    purpose: review
+    system_prompt_id: global.single_course_system
+    input_vars:
+      - step_label
+      - threshold
+      - rubric_text
+      - markdown
+      - forbidden_topics
+    output_contract: structured_review_json
+    file: deepseek/review/step_artifact.md
+
+  - prompt_id: review.material_checklist
+    version: v1
+    provider: deepseek
+    mode: single
+    step_id: material_checklist
+    purpose: review
+    system_prompt_id: global.single_course_system
+    input_vars:
+      - step_label
+      - threshold
+      - rubric_text
+      - markdown
+      - forbidden_topics
+    output_contract: structured_review_json
+    file: deepseek/review/step_artifact.md
+
   - prompt_id: improve.step_artifact
     version: v1
     provider: deepseek
@@ -254,12 +368,126 @@ prompts:
     purpose: improve
     input_vars:
       - step_label
-      - context_summary
+      - structured_inputs
+      - confirmed_artifacts
+      - source_summary
       - approved_changes
       - markdown
-      - constraint_summary
       - source_version
       - revision_goal
-      - prior_step_artifacts
+    output_contract: revised_step_artifact_markdown
+    file: deepseek/improve/step_artifact.md
+
+  - prompt_id: improve.series_framework
+    version: v1
+    provider: deepseek
+    mode: series
+    step_id: series_framework
+    purpose: improve
+    system_prompt_id: global.series_course_system
+    input_vars:
+      - step_label
+      - structured_inputs
+      - confirmed_artifacts
+      - source_summary
+      - approved_changes
+      - markdown
+      - source_version
+      - revision_goal
+    output_contract: revised_step_artifact_markdown
+    file: deepseek/improve/step_artifact.md
+
+  - prompt_id: improve.course_title
+    version: v1
+    provider: deepseek
+    mode: single
+    step_id: course_title
+    purpose: improve
+    system_prompt_id: global.single_course_system
+    input_vars:
+      - step_label
+      - structured_inputs
+      - confirmed_artifacts
+      - source_summary
+      - approved_changes
+      - markdown
+      - source_version
+      - revision_goal
+    output_contract: revised_step_artifact_markdown
+    file: deepseek/improve/step_artifact.md
+
+  - prompt_id: improve.course_framework
+    version: v1
+    provider: deepseek
+    mode: single
+    step_id: course_framework
+    purpose: improve
+    system_prompt_id: global.single_course_system
+    input_vars:
+      - step_label
+      - structured_inputs
+      - confirmed_artifacts
+      - source_summary
+      - approved_changes
+      - markdown
+      - source_version
+      - revision_goal
+    output_contract: revised_step_artifact_markdown
+    file: deepseek/improve/step_artifact.md
+
+  - prompt_id: improve.case_output
+    version: v1
+    provider: deepseek
+    mode: single
+    step_id: case_output
+    purpose: improve
+    system_prompt_id: global.single_course_system
+    input_vars:
+      - step_label
+      - structured_inputs
+      - confirmed_artifacts
+      - source_summary
+      - approved_changes
+      - markdown
+      - source_version
+      - revision_goal
+    output_contract: revised_step_artifact_markdown
+    file: deepseek/improve/step_artifact.md
+
+  - prompt_id: improve.script_output
+    version: v1
+    provider: deepseek
+    mode: single
+    step_id: script_output
+    purpose: improve
+    system_prompt_id: global.single_course_system
+    input_vars:
+      - step_label
+      - structured_inputs
+      - confirmed_artifacts
+      - source_summary
+      - approved_changes
+      - markdown
+      - source_version
+      - revision_goal
+    output_contract: revised_step_artifact_markdown
+    file: deepseek/improve/step_artifact.md
+
+  - prompt_id: improve.material_checklist
+    version: v1
+    provider: deepseek
+    mode: single
+    step_id: material_checklist
+    purpose: improve
+    system_prompt_id: global.single_course_system
+    input_vars:
+      - step_label
+      - structured_inputs
+      - confirmed_artifacts
+      - source_summary
+      - approved_changes
+      - markdown
+      - source_version
+      - revision_goal
     output_contract: revised_step_artifact_markdown
     file: deepseek/improve/step_artifact.md

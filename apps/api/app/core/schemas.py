@@ -158,6 +158,25 @@ class SavedArtifactRecord(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class StepArtifactStatus(str, Enum):
+    EMPTY = "empty"
+    GENERATED = "generated"
+    CONFIRMED = "confirmed"
+
+
+class StepArtifactRecord(BaseModel):
+    step_artifact_id: str = Field(default_factory=lambda: uuid4().hex)
+    step_id: str
+    label: str
+    status: StepArtifactStatus = StepArtifactStatus.EMPTY
+    current_artifact_id: str | None = None
+    current_version: int | None = None
+    confirmed_artifact_id: str | None = None
+    confirmed_version: int | None = None
+    latest_review_batch_id: str | None = None
+    updated_at: datetime = Field(default_factory=utc_now)
+
+
 class DraftArtifact(BaseModel):
     artifact_id: str = Field(default_factory=lambda: uuid4().hex)
     version: int = 1
@@ -369,6 +388,7 @@ class ThreadState(BaseModel):
     decision_ledger: list[DecisionItem] = Field(default_factory=list)
     decision_summary: str = ""
     workflow_steps: list[WorkflowStepState] = Field(default_factory=list)
+    step_artifacts: list[StepArtifactRecord] = Field(default_factory=list)
     saved_artifacts: list[SavedArtifactRecord] = Field(default_factory=list)
     source_manifest: list[SourceDocument] = Field(default_factory=list)
     draft_artifact: DraftArtifact | None = None

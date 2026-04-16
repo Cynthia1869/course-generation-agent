@@ -31,6 +31,8 @@ from app.core.schemas import (
     ReviewCriterionResult,
     ReviewSuggestion,
     SavedArtifactRecord,
+    StepArtifactRecord,
+    StepArtifactStatus,
     StepStatus,
     ThreadHistoryEntry,
     ThreadState,
@@ -208,6 +210,9 @@ class CourseGraph:
     def _current_step_state(self, state: ThreadState):
         return next((step for step in state.workflow_steps if step.step_id == state.current_step_id), None)
 
+    def _current_step_artifact(self, state: ThreadState) -> StepArtifactRecord | None:
+        return next((item for item in state.step_artifacts if item.step_id == state.current_step_id), None)
+
     def _constraint_summary(self, state: ThreadState) -> str:
         active = [item.instruction for item in state.conversation_constraints if item.active]
         return "\n".join(f"- {item}" for item in active) if active else "无额外约束"
@@ -275,6 +280,8 @@ class CourseGraph:
             constraint_summary=self._constraint_summary(state),
             source_version=state.draft_artifact.version if state.draft_artifact else None,
             revision_goal=revision_goal,
+            step_label=self._current_step(state).label,
+            prior_step_artifacts=self._prior_step_artifacts_summary(state, self._current_step(state)),
         )
 
     async def _timeline(self, thread_id: str, event_type: str, title: str, detail: str | None = None, payload: dict[str, Any] | None = None) -> None:
@@ -344,6 +351,23 @@ class CourseGraph:
         step_state.artifact_id = record.artifact_id
         return record
 
+    def _sync_current_step_artifact_state(self, state: ThreadState, *, review_batch_id: str | None = None) -> None:
+        if state.draft_artifact is None:
+            return
+        record = self._current_step_artifact(state)
+        step_state = self._current_step_state(state)
+        if record is None and step_state is not None:
+            record = StepArtifactRecord(step_id=step_state.step_id, label=step_state.label)
+            state.step_artifacts.append(record)
+        if record is None:
+            return
+        record.status = StepArtifactStatus.GENERATED
+        record.current_artifact_id = state.draft_artifact.artifact_id
+        record.current_version = state.draft_artifact.version
+        if review_batch_id is not None:
+            record.latest_review_batch_id = review_batch_id
+        record.updated_at = datetime.now(UTC)
+
     async def intake_message(self, raw_state: dict[str, Any]) -> dict[str, Any]:
         state = await self._load_state(raw_state)
         return await self._save_state(state, "intake_message", "GRAPH_NODE_ENTERED", {"message_count": len(state.messages), "step_id": state.current_step_id})
@@ -410,7 +434,16 @@ class CourseGraph:
             return await self._save_state(state, "clarify_question", "GRAPH_NODE_SKIPPED", {"reason": "no_missing_requirement"})
         question = ""
         await self.broker.publish(state.thread_id, {"type": "clarification_started", "thread_id": state.thread_id, "payload": {"slot_id": missing_slot_id, "step_id": step.step_id}})
-        async for chunk in self.deepseek.stream_clarification({"slot_summary": state.runtime.clarification.slot_summary, "missing_requirement": missing_requirement}):
+        async for chunk in self.deepseek.stream_clarification(
+            {
+                "prompt_id": f"clarify.{step.step_id}",
+                "step_label": step.label,
+                "allowed_scope": "、".join([SLOT_DEFINITIONS[item].label for item in [*step.required_slots, *step.optional_slots]]) or "无",
+                "forbidden_scope": "、".join(step.forbidden_topics) or "无",
+                "slot_summary": state.runtime.clarification.slot_summary,
+                "missing_requirement": missing_requirement,
+            }
+        ):
             question += chunk
             await self.broker.publish(state.thread_id, {"type": "assistant_token", "thread_id": state.thread_id, "payload": {"content": chunk}})
         state.messages.append(MessageRecord(role=MessageRole.ASSISTANT, content=question))
@@ -475,6 +508,7 @@ class CourseGraph:
 
         async for chunk in self.deepseek.stream_step_markdown(
             {
+                "prompt_id": step.prompt_id,
                 "step_label": step.label,
                 "generation_goal": step.generation_goal,
                 "required_slots": "\n".join(f"- {SLOT_DEFINITIONS[slot_id].label}" for slot_id in step.required_slots),
@@ -503,6 +537,7 @@ class CourseGraph:
         state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, source_version=artifact.source_version, revision_goal=artifact.revision_goal, generation_run_id=artifact.generation_run_id))
         await self.store.upsert_artifact_version(state.thread_id, artifact)
         await self._persist_current_step_artifact(state)
+        self._sync_current_step_artifact_state(state)
         self._complete_run(state, target_version=artifact.version, preview=artifact.markdown)
         await self.broker.publish(state.thread_id, {"type": "artifact_updated", "thread_id": state.thread_id, "payload": artifact.model_dump(mode="json")})
         await self.broker.publish(state.thread_id, {"type": "generation_completed", "thread_id": state.thread_id, "payload": {"version": artifact.version, "step_id": step.step_id}})
@@ -513,7 +548,11 @@ class CourseGraph:
         state = await self._load_state(raw_state)
         step = self._current_step(state)
         state.status = ThreadStatus.REVIEW_PENDING
-        result = await self.deepseek.review_markdown(markdown=state.draft_artifact.markdown, rubric=RUBRIC, threshold=self.settings.default_review_threshold)
+        result = await self.deepseek.review_markdown(
+            markdown=state.draft_artifact.markdown,
+            rubric=RUBRIC,
+            threshold=self.settings.default_review_threshold,
+        )
         batch = ReviewBatch(
             step_id=step.step_id,
             draft_version=state.draft_artifact.version,
@@ -524,6 +563,7 @@ class CourseGraph:
         )
         state.review_batches.append(batch)
         self._session(state).review_batch_id = batch.review_batch_id
+        self._sync_current_step_artifact_state(state, review_batch_id=batch.review_batch_id)
         await self.store.append_review_batch(state.thread_id, batch)
         await self.broker.publish(state.thread_id, {"type": "review_batch", "thread_id": state.thread_id, "payload": batch.model_dump(mode="json")})
         await self.broker.publish(state.thread_id, {"type": "review_ready", "thread_id": state.thread_id, "payload": batch.model_dump(mode="json")})
@@ -555,6 +595,8 @@ class CourseGraph:
             constraint_summary=self._constraint_summary(state),
             source_version=session.source_version,
             revision_goal=session.revision_goal,
+            step_label=step.label,
+            prior_step_artifacts=self._prior_step_artifacts_summary(state, step),
         )
         artifact = DraftArtifact(
             version=(state.draft_artifact.version + 1),
@@ -568,6 +610,7 @@ class CourseGraph:
         state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, source_version=artifact.source_version, revision_goal=artifact.revision_goal, generation_run_id=artifact.generation_run_id))
         await self.store.upsert_artifact_version(state.thread_id, artifact)
         await self._persist_current_step_artifact(state)
+        self._sync_current_step_artifact_state(state)
         self._complete_run(state, target_version=artifact.version, preview=artifact.markdown)
         await self.broker.publish(state.thread_id, {"type": "revision_started", "thread_id": state.thread_id, "payload": {"loop": session.auto_optimization_loops, "step_id": step.step_id}})
         return await self._save_state(state, "auto_improve", "DRAFT_REVISED", {"mode": "auto", "loop": session.auto_optimization_loops, "step_id": step.step_id})
@@ -605,6 +648,8 @@ class CourseGraph:
             constraint_summary=self._constraint_summary(state),
             source_version=session.source_version,
             revision_goal=session.revision_goal,
+            step_label=step.label,
+            prior_step_artifacts=self._prior_step_artifacts_summary(state, step),
         )
         artifact = DraftArtifact(
             version=(state.draft_artifact.version + 1),
@@ -618,6 +663,7 @@ class CourseGraph:
         state.version_chain.append(VersionRecord(version=artifact.version, artifact_id=artifact.artifact_id, source_version=artifact.source_version, revision_goal=artifact.revision_goal, generation_run_id=artifact.generation_run_id))
         await self.store.upsert_artifact_version(state.thread_id, artifact)
         await self._persist_current_step_artifact(state)
+        self._sync_current_step_artifact_state(state)
         self._complete_run(state, target_version=artifact.version, preview=artifact.markdown)
         await self.broker.publish(state.thread_id, {"type": "revision_started", "thread_id": state.thread_id, "payload": {"approved_count": len(instructions), "step_id": step.step_id}})
         return await self._save_state(state, "revise_step_artifact", "DRAFT_REVISED", {"step_id": step.step_id, "approved_count": len(instructions), "revised": True})
@@ -638,6 +684,8 @@ class CourseGraph:
             constraint_summary=self._constraint_summary(state),
             source_version=state.draft_artifact.version,
             revision_goal=instruction,
+            step_label=step.label,
+            prior_step_artifacts=self._prior_step_artifacts_summary(state, step),
         )
         artifact = DraftArtifact(
             version=(state.draft_artifact.version + 1),

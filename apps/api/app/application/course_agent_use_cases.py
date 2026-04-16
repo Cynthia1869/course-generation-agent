@@ -28,6 +28,8 @@ from app.core.schemas import (
     ReviewSubmitRequest,
     ReviewSuggestion,
     SavedArtifactRecord,
+    StepArtifactRecord,
+    StepArtifactStatus,
     StepStatus,
     ThreadHistoryEntry,
     ThreadStatus,
@@ -54,6 +56,50 @@ class CourseAgentSupport:
 
     def build_workflow_steps(self, mode: CourseMode) -> list[WorkflowStepState]:
         return build_workflow_steps(mode)
+
+    def build_step_artifacts(self, workflow_steps: list[WorkflowStepState]) -> list[StepArtifactRecord]:
+        return [
+            StepArtifactRecord(
+                step_id=step.step_id,
+                label=step.label,
+            )
+            for step in workflow_steps
+        ]
+
+    def get_step_artifact(self, state, step_id: str) -> StepArtifactRecord | None:
+        return next((item for item in state.step_artifacts if item.step_id == step_id), None)
+
+    def sync_step_artifact_generated(self, state, *, step_id: str, artifact_id: str, version: int, review_batch_id: str | None = None) -> None:
+        record = self.get_step_artifact(state, step_id)
+        if record is None:
+            step = next((item for item in state.workflow_steps if item.step_id == step_id), None)
+            if step is None:
+                return
+            record = StepArtifactRecord(step_id=step.step_id, label=step.label)
+            state.step_artifacts.append(record)
+        record.status = StepArtifactStatus.GENERATED
+        record.current_artifact_id = artifact_id
+        record.current_version = version
+        record.latest_review_batch_id = review_batch_id
+        record.updated_at = datetime.now(UTC)
+
+    def sync_step_artifact_confirmed(self, state, *, step_id: str) -> None:
+        record = self.get_step_artifact(state, step_id)
+        if record is None:
+            step = next((item for item in state.workflow_steps if item.step_id == step_id), None)
+            if step is None:
+                return
+            record = StepArtifactRecord(step_id=step.step_id, label=step.label)
+            state.step_artifacts.append(record)
+        if record.current_artifact_id is None and state.draft_artifact is not None:
+            record.current_artifact_id = state.draft_artifact.artifact_id
+            record.current_version = state.draft_artifact.version
+        if record.current_artifact_id is None:
+            return
+        record.status = StepArtifactStatus.CONFIRMED
+        record.confirmed_artifact_id = record.current_artifact_id
+        record.confirmed_version = record.current_version
+        record.updated_at = datetime.now(UTC)
 
     def sync_step_status(self, state) -> None:
         active_found = False
@@ -152,6 +198,7 @@ class ThreadUseCases:
     async def create_thread(self):
         state = await self.support.store.create_thread()
         state.workflow_steps = self.support.build_workflow_steps(state.course_mode)
+        state.step_artifacts = self.support.build_step_artifacts(state.workflow_steps)
         state.current_step_id = state.workflow_steps[0].step_id if state.workflow_steps else "course_title"
         await self.support.store.save_thread(state)
         await self.support.audit.record(
@@ -164,6 +211,7 @@ class ThreadUseCases:
         state = await self.support.store.get_thread(thread_id)
         state.course_mode = request.mode
         state.workflow_steps = self.support.build_workflow_steps(request.mode)
+        state.step_artifacts = self.support.build_step_artifacts(state.workflow_steps)
         state.current_step_id = state.workflow_steps[0].step_id if state.workflow_steps else "course_title"
         state.draft_artifact = None
         state.review_batches = []
@@ -208,6 +256,7 @@ class ThreadUseCases:
         current_step.status = StepStatus.COMPLETED
         current_step.confirmed_at = datetime.now(UTC)
         current_step.artifact_id = record.artifact_id
+        self.support.sync_step_artifact_confirmed(state, step_id=request.step_id)
 
         next_step_id = self.support.next_step_id(state)
         if next_step_id == current_step.step_id:
@@ -311,6 +360,14 @@ class ArtifactUseCases:
 
     async def update_artifact(self, thread_id: str, markdown: str):
         artifact = await self.support.store.update_artifact_content(thread_id, markdown)
+        state = await self.support.store.get_thread(thread_id)
+        self.support.sync_step_artifact_generated(
+            state,
+            step_id=state.current_step_id,
+            artifact_id=artifact.artifact_id,
+            version=artifact.version,
+        )
+        await self.support.store.save_thread(state)
         await self.support.audit.record(
             AuditEvent(thread_id=thread_id, event_type="ARTIFACT_EDITED", artifact_version=artifact.version, payload_summary={"length": len(markdown)})
         )
@@ -390,6 +447,8 @@ class ArtifactUseCases:
             constraint_summary=self.support.constraint_summary(state),
             source_version=base_artifact.version,
             revision_goal=request.instruction,
+            step_label=next((step.label for step in state.workflow_steps if step.step_id == state.current_step_id), "当前步骤产物"),
+            prior_step_artifacts=self.support.graph._prior_step_artifacts_summary(state, self.support.graph._current_step(state)),
         )
         next_version = max([item.version for item in await self.support.store.list_versions(thread_id)], default=0) + 1
         artifact = DraftArtifact(
@@ -416,8 +475,18 @@ class ArtifactUseCases:
                 created_at=artifact.created_at,
             )
         )
+        self.support.sync_step_artifact_generated(
+            state,
+            step_id=state.current_step_id,
+            artifact_id=artifact.artifact_id,
+            version=artifact.version,
+        )
         await self.support.store.upsert_artifact_version(thread_id, artifact)
-        review_result = await self.support.graph.deepseek.review_markdown(markdown=artifact.markdown, rubric=RUBRIC, threshold=self.settings.default_review_threshold)
+        review_result = await self.support.graph.deepseek.review_markdown(
+            markdown=artifact.markdown,
+            rubric=RUBRIC,
+            threshold=self.settings.default_review_threshold,
+        )
         batch = ReviewBatch(
             step_id=state.current_step_id,
             draft_version=artifact.version,
@@ -427,6 +496,13 @@ class ArtifactUseCases:
             threshold=self.settings.default_review_threshold,
         )
         state.review_batches.append(batch)
+        self.support.sync_step_artifact_generated(
+            state,
+            step_id=state.current_step_id,
+            artifact_id=artifact.artifact_id,
+            version=artifact.version,
+            review_batch_id=batch.review_batch_id,
+        )
         await self.support.store.append_review_batch(thread_id, batch)
         state.status = ThreadStatus.REVIEW_PENDING
         await self.support.store.save_thread(state)

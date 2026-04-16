@@ -131,6 +131,24 @@ function bindInputEl(el: Element | ComponentPublicInstance | null) {
         @copy-viewed-file="workspace.artifactViewer.copyViewedFile"
       />
 
+      <div v-if="workspace.currentStep" class="step-action-wrap">
+        <div class="step-action-card">
+          <div class="step-action-copy">
+            <p class="step-action-eyebrow">当前步骤</p>
+            <h2 class="step-action-title">{{ workspace.currentStep.label }}</h2>
+            <p class="step-action-hint">{{ workspace.stepActionHint }}</p>
+          </div>
+          <div class="step-action-buttons">
+            <button class="step-action-btn step-action-btn--secondary" :disabled="!workspace.canContinueModifyCurrentStep" @click="workspace.continueModifyCurrentStep">
+              继续修改
+            </button>
+            <button class="step-action-btn step-action-btn--primary" :disabled="!workspace.canConfirmCurrentStep" @click="workspace.confirmCurrentStep">
+              确认步骤
+            </button>
+          </div>
+        </div>
+      </div>
+
       <div class="composer-wrap">
         <div class="chat-composer">
           <textarea
@@ -173,6 +191,9 @@ function bindInputEl(el: Element | ComponentPublicInstance | null) {
         <ArtifactPanel
           :visible-workflow-steps="workspace.visibleWorkflowSteps"
           :content-creation-steps="workspace.contentCreationSteps"
+          :current-step="workspace.currentStep"
+          :current-step-artifact="workspace.currentStepArtifact"
+          :current-step-artifact-meta="workspace.currentStepArtifactMeta"
           :generated-artifacts="workspace.generatedArtifacts"
           :package-files="workspace.packageFiles"
           @click-step="workspace.clickStep"
@@ -794,6 +815,84 @@ html, body, #app {
 
 /* ─── Chat composer ─── */
 .composer-wrap { flex-shrink: 0; padding: 8px 18px 14px; }
+.step-action-wrap {
+  flex-shrink: 0;
+  padding: 12px 18px 0;
+}
+.step-action-card {
+  max-width: 820px;
+  margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 14px 16px;
+  border: 1px solid var(--border-cream);
+  border-radius: var(--r-xl);
+  background: rgba(250, 249, 245, 0.92);
+  box-shadow: var(--ivory) 0 0 0 0, var(--ring-1) 0 0 0 1px;
+}
+.step-action-copy {
+  min-width: 0;
+  flex: 1;
+}
+.step-action-eyebrow {
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+  margin-bottom: 4px;
+}
+.step-action-title {
+  font-size: 17px;
+  line-height: 1.3;
+  color: var(--text-1);
+  font-weight: 600;
+}
+.step-action-hint {
+  font-size: 12.5px;
+  color: var(--text-2);
+  line-height: 1.6;
+  margin-top: 4px;
+}
+.step-action-buttons {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.step-action-btn {
+  height: 34px;
+  padding: 0 14px;
+  border-radius: 999px;
+  font-size: 12.5px;
+  font-family: var(--font-sans);
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .12s, color .12s, border-color .12s;
+}
+.step-action-btn--primary {
+  border: 1px solid var(--terracotta);
+  background: var(--terracotta);
+  color: var(--ivory);
+}
+.step-action-btn--primary:hover:not(:disabled) {
+  background: var(--terracotta-hover);
+}
+.step-action-btn--secondary {
+  border: 1px solid var(--border-warm);
+  background: var(--ivory);
+  color: var(--text-2);
+}
+.step-action-btn--secondary:hover:not(:disabled) {
+  background: var(--warm-sand);
+  color: var(--text-1);
+}
+.step-action-btn:disabled {
+  opacity: .45;
+  cursor: not-allowed;
+}
 .chat-composer {
   max-width: 820px; margin: 0 auto;
   background: var(--ivory); border: 1px solid var(--border-cream); border-radius: var(--r-xl);
@@ -871,6 +970,66 @@ html, body, #app {
 .artifacts-block {
   flex: 1; min-height: 0;
   overflow-y: auto; padding: 12px 14px 10px;
+}
+.current-artifact-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 12px;
+  margin-bottom: 10px;
+  border: 1px solid var(--border-cream);
+  border-radius: var(--r-lg);
+  background: var(--parchment);
+}
+.current-artifact-card.ready {
+  border-color: var(--terracotta-border);
+  background: var(--terracotta-bg);
+}
+.current-artifact-copy {
+  min-width: 0;
+  flex: 1;
+}
+.current-artifact-label {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-3);
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+.current-artifact-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-1);
+  margin-top: 2px;
+}
+.current-artifact-meta {
+  font-size: 11px;
+  color: var(--text-2);
+  margin-top: 3px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.current-artifact-version {
+  font-size: 10.5px;
+  color: var(--text-3);
+  margin-top: 4px;
+}
+.current-artifact-open {
+  height: 28px;
+  padding: 0 12px;
+  border-radius: 999px;
+  border: 1px solid var(--terracotta-border);
+  background: var(--ivory);
+  color: var(--terracotta);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.current-artifact-open:hover {
+  background: var(--terracotta);
+  color: var(--ivory);
 }
 
 /* File cards */

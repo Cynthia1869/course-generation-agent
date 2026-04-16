@@ -1654,6 +1654,37 @@ export interface components {
                 [key: string]: unknown;
             };
         };
+        /** StepArtifactRecord */
+        StepArtifactRecord: {
+            /** Step Artifact Id */
+            step_artifact_id?: string;
+            /** Step Id */
+            step_id: string;
+            /** Label */
+            label: string;
+            /** @default empty */
+            status: components["schemas"]["StepArtifactStatus"];
+            /** Current Artifact Id */
+            current_artifact_id?: string | null;
+            /** Current Version */
+            current_version?: number | null;
+            /** Confirmed Artifact Id */
+            confirmed_artifact_id?: string | null;
+            /** Confirmed Version */
+            confirmed_version?: number | null;
+            /** Latest Review Batch Id */
+            latest_review_batch_id?: string | null;
+            /**
+             * Updated At
+             * Format: date-time
+             */
+            updated_at?: string;
+        };
+        /**
+         * StepArtifactStatus
+         * @enum {string}
+         */
+        StepArtifactStatus: "empty" | "generated" | "confirmed";
         /**
          * StepStatus
          * @enum {string}
@@ -1743,6 +1774,8 @@ export interface components {
             decision_summary: string;
             /** Workflow Steps */
             workflow_steps?: components["schemas"]["WorkflowStepState"][];
+            /** Step Artifacts */
+            step_artifacts?: components["schemas"]["StepArtifactRecord"][];
             /** Saved Artifacts */
             saved_artifacts?: components["schemas"]["SavedArtifactRecord"][];
             /** Source Manifest */

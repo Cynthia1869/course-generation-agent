@@ -2,6 +2,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 
 import {
   ApiError,
+  confirmThreadStep,
   createThread,
   deleteThread,
   fetchDiff,
@@ -22,6 +23,7 @@ import type {
   DraftArtifact,
   ReviewBatch,
   SavedArtifactRecord,
+  StepArtifactRecord,
   ThreadHistoryEntry,
   ThreadState,
   ThreadSummary,
@@ -85,10 +87,50 @@ export function useThreadWorkspace() {
   const recentThreads = computed(() => threadList.value.filter((t) => t.thread_id !== threadId.value));
   const visibleWorkflowSteps = computed<WorkflowStepState[]>(() => {
     const steps = threadState.value?.workflow_steps ?? [];
-    return threadState.value?.course_mode === "series" ? steps : steps.filter((s) => s.step_id !== "step_0");
+    return steps;
   });
+  const currentStep = computed<WorkflowStepState | null>(() => visibleWorkflowSteps.value.find((s) => s.step_id === (threadState.value?.current_step_id ?? "")) ?? null);
   const generatedArtifacts = computed<SavedArtifactRecord[]>(() => (threadState.value?.saved_artifacts ?? []).filter((a) => a.kind === "generated"));
+  const stepArtifacts = computed<StepArtifactRecord[]>(() => threadState.value?.step_artifacts ?? []);
   const packageFiles = computed<SavedArtifactRecord[]>(() => (threadState.value?.saved_artifacts ?? []).filter((a) => a.kind === "uploaded"));
+  const currentStepArtifact = computed<SavedArtifactRecord | null>(() => {
+    const stepId = currentStep.value?.step_id;
+    if (!stepId) return null;
+    const stepArtifact = stepArtifacts.value.find((artifact) => artifact.step_id === stepId);
+    if (!stepArtifact?.current_artifact_id) {
+      return generatedArtifacts.value.find((artifact) => artifact.step_id === stepId) ?? null;
+    }
+    return generatedArtifacts.value.find((artifact) => artifact.artifact_id === stepArtifact.current_artifact_id) ?? null;
+  });
+  const currentStepArtifactMeta = computed(() => {
+    const stepId = currentStep.value?.step_id;
+    if (!stepId) return null;
+    return stepArtifacts.value.find((artifact) => artifact.step_id === stepId) ?? null;
+  });
+  const currentStepReview = computed<ReviewBatch | null>(() => {
+    const stepId = currentStep.value?.step_id;
+    const version = threadState.value?.draft_artifact?.version;
+    if (!stepId || version == null) return null;
+    const batches = threadState.value?.review_batches ?? [];
+    return [...batches].reverse().find((batch) => batch.step_id === stepId && batch.draft_version === version) ?? null;
+  });
+  const canConfirmCurrentStep = computed(() => {
+    if (!currentStep.value || currentStep.value.status !== "active") return false;
+    if (!currentStepArtifact.value) return false;
+    if (!currentStep.value.needs_review) return true;
+    if (!currentStepReview.value) return false;
+    return currentStepReview.value.total_score >= currentStepReview.value.threshold;
+  });
+  const canContinueModifyCurrentStep = computed(() => !!currentStepArtifact.value);
+  const stepActionHint = computed(() => {
+    if (!currentStep.value) return "";
+    if (!currentStepArtifact.value) return `当前步骤“${currentStep.value.label}”还没有可确认产物，先继续补充或生成。`;
+    if (currentStep.value.needs_review && !currentStepReview.value) return `当前步骤“${currentStep.value.label}”还没有最新评审结果，暂时不能确认。`;
+    if (currentStep.value.needs_review && currentStepReview.value && currentStepReview.value.total_score < currentStepReview.value.threshold) {
+      return `当前步骤“${currentStep.value.label}”评分未达标，需要继续修改后再确认。`;
+    }
+    return `当前步骤“${currentStep.value.label}”已满足确认条件，可以确认进入下一步，或继续修改。`;
+  });
   const canRetract = computed(() => {
     const last = messages.value[messages.value.length - 1];
     return !processing.value && !!last && last.role === "user" && threadState.value?.status === "collecting_requirements";
@@ -440,6 +482,33 @@ export function useThreadWorkspace() {
     if (artifact) await artifactViewer.openFileViewer(artifact);
   }
 
+  async function confirmCurrentStep() {
+    if (!threadId.value || !currentStep.value) return;
+    try {
+      await confirmThreadStep(threadId.value, currentStep.value.step_id);
+      runtimeStatus.value = `已确认“${currentStep.value.label}”`;
+      await refreshThread();
+    } catch (err) {
+      console.error(err);
+      if (err instanceof ApiError && typeof err.detail === "object" && err.detail && "detail" in (err.detail as Record<string, unknown>)) {
+        const detail = (err.detail as { detail?: { message?: string } }).detail;
+        runtimeStatus.value = detail?.message ?? "当前步骤暂时不能确认";
+      } else {
+        runtimeStatus.value = "当前步骤暂时不能确认";
+      }
+    }
+  }
+
+  async function continueModifyCurrentStep() {
+    if (!currentStepArtifact.value) {
+      inputEl.value?.focus();
+      return;
+    }
+    await artifactViewer.openFileViewer(currentStepArtifact.value);
+    artifactViewer.rightTab.value = "edit";
+    runtimeStatus.value = `正在修改“${currentStep.value?.label ?? "当前步骤"}”`;
+  }
+
   async function selectThread(tid: string) {
     if (!tid || tid === threadId.value) return;
     reconnectNotice.value = "";
@@ -528,12 +597,20 @@ export function useThreadWorkspace() {
     recentThreads,
     visibleWorkflowSteps,
     generatedArtifacts,
+    stepArtifacts,
     packageFiles,
     canRetract,
     editableUserMessageId,
     currentCourseMode,
     contentCreationSteps,
     statusLabel,
+    currentStep,
+    currentStepArtifact,
+    currentStepArtifactMeta,
+    currentStepReview,
+    canConfirmCurrentStep,
+    canContinueModifyCurrentStep,
+    stepActionHint,
     autoResize,
     scrollBottom,
     selectThread,
@@ -553,6 +630,8 @@ export function useThreadWorkspace() {
     fillChip,
     handleKeydown,
     clickStep,
+    confirmCurrentStep,
+    continueModifyCurrentStep,
     toggleThreadMenu,
     refreshThread,
     artifactViewer,

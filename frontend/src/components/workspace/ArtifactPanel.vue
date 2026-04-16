@@ -1,11 +1,14 @@
 <script setup lang="ts">
 import { ref } from "vue";
 
-import type { SavedArtifactRecord, WorkflowStepState } from "../../types";
+import type { SavedArtifactRecord, StepArtifactRecord, WorkflowStepState } from "../../types";
 
 defineProps<{
   visibleWorkflowSteps: WorkflowStepState[];
   contentCreationSteps: WorkflowStepState[];
+  currentStep: WorkflowStepState | null;
+  currentStepArtifact: SavedArtifactRecord | null;
+  currentStepArtifactMeta: StepArtifactRecord | null;
   generatedArtifacts: SavedArtifactRecord[];
   packageFiles: SavedArtifactRecord[];
 }>();
@@ -63,9 +66,24 @@ function getFileExt(filename: string) {
       <h3 class="rp-title">成果文件</h3>
     </div>
 
+    <div v-if="currentStep" class="current-artifact-card" :class="{ ready: !!currentStepArtifact }">
+      <div class="current-artifact-copy">
+        <div class="current-artifact-label">当前步骤产物</div>
+        <div class="current-artifact-title">{{ currentStep.label }}</div>
+        <div class="current-artifact-meta">
+          {{ currentStepArtifact ? currentStepArtifact.filename : "尚未生成当前步骤产物" }}
+        </div>
+        <div v-if="currentStepArtifactMeta?.current_version" class="current-artifact-version">
+          当前版本 v{{ currentStepArtifactMeta.current_version }}
+          <span v-if="currentStepArtifactMeta.confirmed_version">，已确认版本 v{{ currentStepArtifactMeta.confirmed_version }}</span>
+        </div>
+      </div>
+      <button v-if="currentStepArtifact" class="current-artifact-open" @click="emit('open-artifact', currentStepArtifact)">查看</button>
+    </div>
+
     <div class="file-cards">
       <div
-        v-for="artifact in generatedArtifacts"
+        v-for="artifact in generatedArtifacts.filter((item) => item.artifact_id !== currentStepArtifact?.artifact_id)"
         :key="artifact.artifact_id"
         class="file-card"
         role="button"

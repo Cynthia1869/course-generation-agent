@@ -35,8 +35,13 @@ class RequirementExtractionResult(BaseModel):
     expected_result: str | None = None
     tone_style: str | None = None
     case_preferences: str | None = None
+    case_variable: str | None = None
+    case_flow: str | None = None
+    failure_points: str | None = None
+    application_scene: str | None = None
     script_requirements: str | None = None
-    material_requirements: str | None = None
+    resource_requirements: str | None = None
+    configuration_requirements: str | None = None
 
 
 class DeepSeekClient:
@@ -122,8 +127,8 @@ class DeepSeekClient:
             return
 
         model = self._build_chat_model(self.profile.chat)
-        prompt = self.prompts.render(
-            "deepseek/generate_markdown.md",
+        prompt = self.prompts.render_by_id(
+            "generate.legacy_full_draft",
             decision_summary=context["decision_summary"],
             slot_summary=context["slot_summary"],
             source_summary=context["source_summary"],
@@ -142,8 +147,8 @@ class DeepSeekClient:
             return
 
         model = self._build_chat_model(self.profile.chat)
-        prompt = self.prompts.render(
-            "deepseek/generate_step_markdown.md",
+        prompt = self.prompts.render_by_id(
+            context["prompt_id"],
             step_label=context["step_label"],
             generation_goal=context["generation_goal"],
             required_slots=context["required_slots"],
@@ -172,8 +177,11 @@ class DeepSeekClient:
                 }
             )
         )
-        prompt = self.prompts.render(
-            "deepseek/clarify_requirements.md",
+        prompt = self.prompts.render_by_id(
+            context.get("prompt_id", "clarify.course_title"),
+            step_label=context.get("step_label", "当前步骤"),
+            allowed_scope=context.get("allowed_scope", "仅限当前步骤信息"),
+            forbidden_scope=context.get("forbidden_scope", "不要追问其他步骤内容"),
             slot_summary=context["slot_summary"],
             missing_requirements=f"- {context['missing_requirement']['label']}：{context['missing_requirement']['prompt_hint']}",
         )
@@ -183,7 +191,10 @@ class DeepSeekClient:
     async def stream_clarification(self, context: dict) -> AsyncIterator[str]:
         if not self.can_use_remote_llm():
             item = context["missing_requirement"]
-            text = "为了继续制课，我还需要你补充这一个关键信息：\n" + f"- {item['label']}：{item['prompt_hint']}"
+            text = (
+                f"当前在“{context.get('step_label', '当前步骤')}”这一步，为了继续往下走，我只需要你补充一个信息：\n"
+                + f"- {item['label']}：{item['prompt_hint']}"
+            )
             for chunk in self._split_chunks(text, chunk_size=24):
                 yield chunk
             return
@@ -196,8 +207,11 @@ class DeepSeekClient:
                 }
             )
         )
-        prompt = self.prompts.render(
-            "deepseek/clarify_requirements.md",
+        prompt = self.prompts.render_by_id(
+            context["prompt_id"],
+            step_label=context.get("step_label", "当前步骤"),
+            allowed_scope=context.get("allowed_scope", "仅限当前步骤信息"),
+            forbidden_scope=context.get("forbidden_scope", "不要追问其他步骤内容"),
             slot_summary=context["slot_summary"],
             missing_requirements=f"- {context['missing_requirement']['label']}：{context['missing_requirement']['prompt_hint']}",
         )
@@ -226,8 +240,8 @@ class DeepSeekClient:
                 }
             )
         )
-        prompt = self.prompts.render(
-            "deepseek/extract_requirements.md",
+        prompt = self.prompts.render_by_id(
+            "extract.requirements",
             requirement_defs="\n".join(f"- {item['slot_id']}: {item['label']}，{item['prompt_hint']}" for item in requirement_defs),
             known_requirements="\n".join(f"- {key}: {value}" for key, value in known_requirements.items()) or "无",
             latest_user_message=latest_user_message,
@@ -283,17 +297,37 @@ class DeepSeekClient:
         if case_match:
             extracted["case_preferences"] = case_match.group(1).strip()
 
+        variable_match = re.search(r"变量(?:是)?([^。；;\n]+)", text)
+        if variable_match:
+            extracted["case_variable"] = variable_match.group(1).strip()
+
+        flow_match = re.search(r"流程(?:是)?([^。；;\n]+)", text)
+        if flow_match:
+            extracted["case_flow"] = flow_match.group(1).strip()
+
+        failure_match = re.search(r"(?:失败点|踩坑点)(?:是)?([^。；;\n]+)", text)
+        if failure_match:
+            extracted["failure_points"] = failure_match.group(1).strip()
+
+        scene_match = re.search(r"场景(?:是)?([^。；;\n]+)", text)
+        if scene_match:
+            extracted["application_scene"] = scene_match.group(1).strip()
+
         script_match = re.search(r"逐字稿(?:要求)?是([^。；;\n]+)", text)
         if script_match:
             extracted["script_requirements"] = script_match.group(1).strip()
 
         material_match = re.search(r"素材(?:清单)?(?:要求|范围)?是([^。；;\n]+)", text)
         if material_match:
-            extracted["material_requirements"] = material_match.group(1).strip()
+            extracted["resource_requirements"] = material_match.group(1).strip()
+
+        config_match = re.search(r"配置(?:要求|需求)?是([^。；;\n]+)", text)
+        if config_match:
+            extracted["configuration_requirements"] = config_match.group(1).strip()
 
         return extracted
 
-    async def review_markdown(self, *, markdown: str, rubric: list[dict], threshold: float) -> dict:
+    async def review_markdown(self, *, markdown: str, rubric: list[dict], threshold: float, step_label: str = "当前步骤产物", forbidden_topics: str = "无") -> dict:
         if not self.can_use_remote_llm():
             return self._fallback_review(markdown=markdown, rubric=rubric, threshold=threshold)
 
@@ -302,11 +336,13 @@ class DeepSeekClient:
             f"- {item['criterion_id']}: {item['name']} ({item['description']})"
             for item in rubric
         )
-        prompt = self.prompts.render(
-            "deepseek/review_markdown.md",
+        prompt = self.prompts.render_by_id(
+            "review.step_artifact",
+            step_label=step_label,
             threshold=threshold,
             rubric_text=rubric_text,
             markdown=markdown,
+            forbidden_topics=forbidden_topics,
         )
         structured = model.with_structured_output(dict)
         return await structured.ainvoke(prompt)
@@ -320,6 +356,8 @@ class DeepSeekClient:
         constraint_summary: str = "无额外约束",
         source_version: int | None = None,
         revision_goal: str | None = None,
+        step_label: str = "当前步骤产物",
+        prior_step_artifacts: str = "暂无",
     ) -> str:
         if not approved_changes:
             return markdown
@@ -337,14 +375,16 @@ class DeepSeekClient:
                 }
             )
         )
-        prompt = self.prompts.render(
-            "deepseek/improve_markdown.md",
+        prompt = self.prompts.render_by_id(
+            "improve.step_artifact",
+            step_label=step_label,
             context_summary=context_summary,
             approved_changes="\n".join(f"- {item}" for item in approved_changes),
             markdown=markdown,
             constraint_summary=constraint_summary,
             source_version=source_version or "未指定",
             revision_goal=revision_goal or "根据反馈生成更好的新版本",
+            prior_step_artifacts=prior_step_artifacts,
         )
         response = await model.ainvoke(prompt)
         return response.content if isinstance(response.content, str) else str(response.content)

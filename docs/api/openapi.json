@@ -4161,6 +4161,101 @@
         ],
         "title": "SourceDocument"
       },
+      "StepArtifactRecord": {
+        "properties": {
+          "step_artifact_id": {
+            "type": "string",
+            "title": "Step Artifact Id"
+          },
+          "step_id": {
+            "type": "string",
+            "title": "Step Id"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "status": {
+            "$ref": "#/components/schemas/StepArtifactStatus",
+            "default": "empty"
+          },
+          "current_artifact_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Artifact Id"
+          },
+          "current_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Version"
+          },
+          "confirmed_artifact_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmed Artifact Id"
+          },
+          "confirmed_version": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Confirmed Version"
+          },
+          "latest_review_batch_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Latest Review Batch Id"
+          },
+          "updated_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Updated At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "step_id",
+          "label"
+        ],
+        "title": "StepArtifactRecord"
+      },
+      "StepArtifactStatus": {
+        "type": "string",
+        "enum": [
+          "empty",
+          "generated",
+          "confirmed"
+        ],
+        "title": "StepArtifactStatus"
+      },
       "StepStatus": {
         "type": "string",
         "enum": [
@@ -4372,6 +4467,13 @@
             },
             "type": "array",
             "title": "Workflow Steps"
+          },
+          "step_artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/StepArtifactRecord"
+            },
+            "type": "array",
+            "title": "Step Artifacts"
           },
           "saved_artifacts": {
             "items": {

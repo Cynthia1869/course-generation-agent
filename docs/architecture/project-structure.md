@@ -35,10 +35,12 @@
 
 ## Prompt Management
 
-- `prompts/deepseek/clarify_requirements.md`
-- `prompts/deepseek/generate_markdown.md`
-- `prompts/deepseek/review_markdown.md`
-- `prompts/deepseek/improve_markdown.md`
+- `prompts/prompt_catalog.yaml`
+- `prompts/deepseek/clarify/*.md`
+- `prompts/deepseek/generate/*.md`
+- `prompts/deepseek/review/*.md`
+- `prompts/deepseek/improve/*.md`
+- `prompts/deepseek/extract/*.md`
 
 ## Redesign Docs
 

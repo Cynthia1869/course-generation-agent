@@ -5,6 +5,7 @@ export type MessageRecord = components["schemas"]["MessageRecord"];
 export type DraftArtifact = components["schemas"]["DraftArtifact"];
 export type WorkflowStepState = components["schemas"]["WorkflowStepState"];
 export type SavedArtifactRecord = components["schemas"]["SavedArtifactRecord"];
+export type StepArtifactRecord = components["schemas"]["StepArtifactRecord"];
 export type VersionRecord = components["schemas"]["VersionRecord"];
 export type TimelineEvent = components["schemas"]["TimelineEvent"];
 export type ThreadHistoryEntry = components["schemas"]["ThreadHistoryEntry"];

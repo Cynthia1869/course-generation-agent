@@ -13,7 +13,7 @@ if str(API_ROOT) not in sys.path:
     sys.path.insert(0, str(API_ROOT))
 
 from app.api.deps import get_deepagents_service, get_service
-from app.core.schemas import ConfirmStepRequest, DraftArtifact, ModeUpdateRequest, RegenerateRequest, ReviewBatch, ReviewSubmitRequest, ReviewCriterionResult
+from app.core.schemas import ConfirmStepRequest, DraftArtifact, GenerationSessionState, ModeUpdateRequest, RegenerateRequest, ReviewBatch, ReviewSubmitRequest, ReviewCriterionResult
 from app.core.settings import get_settings
 from app.main import app
 
@@ -53,6 +53,23 @@ async def test_thread_lifecycle():
         payload = thread.json()["data"]["state"]
         assert payload["draft_artifact"] is None
         assert payload["messages"][-1]["role"] == "assistant"
+        assert payload["runtime"]["clarification"]["next_requirement_to_clarify"] in {
+            "topic",
+            "audience",
+            "target_problem",
+            "expected_result",
+            "tone_style",
+        }
+        assert payload["runtime"]["clarification"]["next_requirement_to_clarify"] not in {
+            "case_preferences",
+            "case_variable",
+            "case_flow",
+            "failure_points",
+            "application_scene",
+            "script_requirements",
+            "resource_requirements",
+            "configuration_requirements",
+        }
 
 
 @pytest.mark.asyncio
@@ -69,6 +86,25 @@ async def test_thread_generation_persists_artifact_and_review_batch():
     assert state.draft_artifact is not None
     assert state.review_batches
     assert state.review_batches[-1].total_score >= 0
+
+
+@pytest.mark.asyncio
+async def test_start_generate_is_blocked_until_current_step_required_slots_are_complete():
+    service = get_service()
+    thread = await service.create_thread()
+
+    await service.ingest_message(
+        thread.thread_id,
+        "我要做一节面向初中生的数学课，先聚焦初二三角函数。",
+        "default-user",
+    )
+    await service.ingest_message(thread.thread_id, "开始生成", "default-user")
+
+    state = await service.store.get_thread(thread.thread_id)
+    assert state.current_step_id == "course_title"
+    assert state.draft_artifact is None
+    assert state.runtime.clarification.missing_requirements
+    assert state.messages[-1].role.value == "assistant"
 
 
 @pytest.mark.asyncio
@@ -313,6 +349,9 @@ async def test_mode_switch_and_step_confirmation_persist_artifact(tmp_path: Path
     assert confirmed.workflow_steps[0].status.value == "completed"
     assert confirmed.status.value == "completed"
     assert any(item.filename == "series_framework.md" for item in confirmed.saved_artifacts)
+    step_artifact = next(item for item in confirmed.step_artifacts if item.step_id == "series_framework")
+    assert step_artifact.current_version == 1
+    assert step_artifact.confirmed_version == 1
 
 
 @pytest.mark.asyncio
@@ -540,12 +579,266 @@ async def test_mode_specific_steps_are_distinct():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "expected_current_step", "expected_steps"),
+    [
+        (
+            "single",
+            "course_title",
+            ["course_title", "course_framework", "case_output", "script_output", "material_checklist"],
+        ),
+        ("series", "series_framework", ["series_framework"]),
+    ],
+)
+async def test_mode_to_step_mapping_matches_product_boundary(mode: str, expected_current_step: str, expected_steps: list[str]):
+    service = get_service()
+    thread = await service.create_thread()
+
+    if mode == "series":
+        state = await service.update_mode(thread.thread_id, ModeUpdateRequest(mode="series"))
+    else:
+        state = await service.store.get_thread(thread.thread_id)
+
+    assert state.current_step_id == expected_current_step
+    assert [step.step_id for step in state.workflow_steps] == expected_steps
+    assert [step.status.value for step in state.workflow_steps].count("active") == 1
+    assert state.workflow_steps[0].status.value == "active"
+
+
+@pytest.mark.asyncio
+async def test_switching_mode_clears_stale_artifact_review_and_generation_context():
+    service = get_service()
+    thread = await service.create_thread()
+
+    state = await service.store.get_thread(thread.thread_id)
+    state.draft_artifact = DraftArtifact(version=3, markdown="# 旧稿", summary="旧稿")
+    state.review_batches.append(
+        ReviewBatch(
+            step_id="course_title",
+            draft_version=3,
+            total_score=8.4,
+            threshold=8.0,
+            criteria=[
+                ReviewCriterionResult(
+                    criterion_id="core-problem",
+                    name="核心问题",
+                    weight=1.0,
+                    score=8.4,
+                    max_score=10,
+                    reason="达标",
+                )
+            ],
+            suggestions=[],
+        )
+    )
+    state.runtime.generation_session = GenerationSessionState(step_id="course_title")
+    state.runtime.pending_manual_revision_request = "把案例换掉"
+    await service.store.save_thread(state)
+
+    updated = await service.update_mode(thread.thread_id, ModeUpdateRequest(mode="series"))
+
+    assert updated.course_mode.value == "series"
+    assert updated.current_step_id == "series_framework"
+    assert [step.step_id for step in updated.workflow_steps] == ["series_framework"]
+    assert updated.draft_artifact is None
+    assert updated.review_batches == []
+    assert updated.runtime.generation_session is None
+    assert updated.runtime.pending_manual_revision_request is None
+
+
+@pytest.mark.asyncio
+async def test_clarification_gate_blocks_generation_even_if_user_says_start_generate():
+    service = get_service()
+    thread = await service.create_thread()
+
+    await service.ingest_message(
+        thread.thread_id,
+        "我要做一节面向初中生的数学课，开始生成。",
+        "default-user",
+    )
+
+    state = await service.store.get_thread(thread.thread_id)
+    assert state.draft_artifact is None
+    assert not state.review_batches
+    assert state.status.value == "collecting_requirements"
+    assert state.runtime.clarification.next_requirement_to_clarify in {"topic", "target_problem", "expected_result", "tone_style"}
+    assert state.messages[-1].role.value == "assistant"
+    assert state.messages[-1].content.startswith("当前在“课程标题”这一步，为了继续往下走，我只需要你补充一个信息：")
+
+
+@pytest.mark.asyncio
+async def test_confirm_gate_requires_explicit_start_generate_after_required_slots_are_complete():
+    service = get_service()
+    thread = await service.create_thread()
+
+    await service.ingest_message(
+        thread.thread_id,
+        "我要做一门课，主题是三角函数，给初中生，解决基础题不会做的问题，学完能独立完成基础题，风格实操带练。",
+        "default-user",
+    )
+
+    state = await service.store.get_thread(thread.thread_id)
+    assert state.runtime.clarification.missing_requirements == []
+    assert state.draft_artifact is None
+    assert not state.review_batches
+    assert state.status.value == "collecting_requirements"
+    assert state.messages[-1].role.value == "assistant"
+    assert "如果这些信息没问题，你回复“开始生成”即可。" in state.messages[-1].content
+    assert "这一步只会生成“课程标题”相关内容" in state.messages[-1].content
+
+
+@pytest.mark.asyncio
+async def test_series_review_gate_keeps_series_framework_pending_after_generation(monkeypatch: pytest.MonkeyPatch):
+    service = get_service()
+
+    async def fake_review_markdown(*, markdown: str, rubric: list[dict], threshold: float):
+        return {
+            "total_score": 8.8,
+            "criteria": [
+                {
+                    "criterion_id": item["criterion_id"],
+                    "name": item["name"],
+                    "weight": item["weight"],
+                    "score": 8.8,
+                    "max_score": item["max_score"],
+                    "reason": "整体达标。",
+                }
+                for item in rubric
+            ],
+            "suggestions": [
+                {
+                    "criterion_id": "case-design",
+                    "problem": "案例还可以更贴近课堂。",
+                    "suggestion": "把案例改成更贴近课堂的练习场景。",
+                    "evidence_span": "案例部分",
+                    "severity": "medium",
+                }
+            ],
+        }
+
+    monkeypatch.setattr(service.graph.deepseek, "review_markdown", fake_review_markdown)
+
+    thread = await service.create_thread()
+    await service.update_mode(thread.thread_id, ModeUpdateRequest(mode="series"))
+    await service.ingest_message(
+        thread.thread_id,
+        "我要做一门入门课，给初中生，主题是三角函数，解决基础题不会做的问题，学完能独立完成基础题，风格实操带练，要求基于真实案例。",
+        "default-user",
+    )
+    await service.ingest_message(thread.thread_id, "开始生成", "default-user")
+
+    state = await service.store.get_thread(thread.thread_id)
+    batch = state.review_batches[-1]
+
+    assert state.status.value == "review_pending"
+    assert state.workflow_steps[0].status.value == "active"
+    assert state.draft_artifact is not None
+    assert state.runtime.human_review.interrupt_payload is not None
+    assert state.runtime.human_review.interrupt_payload.review_batch_id == batch.review_batch_id
+    assert state.runtime.human_review.interrupt_payload.total_score == batch.total_score
+
+
+@pytest.mark.asyncio
+async def test_confirm_step_api_reports_review_gate_when_latest_review_score_is_below_threshold():
+    service = get_service()
+    thread = await service.create_thread()
+    await service.update_mode(thread.thread_id, ModeUpdateRequest(mode="series"))
+
+    state = await service.store.get_thread(thread.thread_id)
+    state.draft_artifact = DraftArtifact(version=1, markdown="# 系列课程框架\n\n内容", summary="系列框架")
+    state.review_batches.append(
+        ReviewBatch(
+            step_id="series_framework",
+            draft_version=1,
+            total_score=7.1,
+            threshold=8.0,
+            criteria=[
+                ReviewCriterionResult(
+                    criterion_id="core-problem",
+                    name="核心问题",
+                    weight=1.0,
+                    score=7.1,
+                    max_score=10,
+                    reason="未达标",
+                )
+            ],
+            suggestions=[],
+        )
+    )
+    await service.store.save_thread(state)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.post(
+            f"/api/v1/threads/{thread.thread_id}/confirm-step",
+            json={"step_id": "series_framework"},
+        )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "step_confirmation_rejected"
+    assert response.json()["detail"]["message"] == "Current step review score does not meet the threshold"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("category", "expected_kind", "expected_step_id"),
+    [
+        ("context", "reference", "course_title"),
+        ("package", "uploaded", "package_upload"),
+    ],
+)
+async def test_upload_only_updates_files_and_never_enters_generation_state_machine(category: str, expected_kind: str, expected_step_id: str):
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        created = await client.post("/api/v1/threads")
+        thread_id = created.json()["data"]["thread"]["thread_id"]
+
+        uploaded = await client.post(
+            f"/api/v1/threads/{thread_id}/files?category={category}",
+            files={"file": ("notes.txt", "三角函数资料", "text/plain")},
+        )
+        assert uploaded.status_code == 200
+
+        thread = await client.get(f"/api/v1/threads/{thread_id}")
+        state = thread.json()["data"]["state"]
+        timeline = await client.get(f"/api/v1/threads/{thread_id}/timeline")
+        saved = next(item for item in state["saved_artifacts"] if item["filename"] == "notes.txt")
+
+        assert state["status"] == "collecting_requirements"
+        assert state["draft_artifact"] is None
+        assert state["runtime"]["generation_session"] is None
+        assert state["generation_runs"] == []
+        assert len(state["source_manifest"]) == 1
+        assert saved["kind"] == expected_kind
+        assert saved["step_id"] == expected_step_id
+        assert "generation_started" not in [item["event_type"] for item in timeline.json()["data"]["timeline"]]
+        assert "review_ready" not in [item["event_type"] for item in timeline.json()["data"]["timeline"]]
+
+
+@pytest.mark.asyncio
 async def test_confirm_step_rejects_when_artifact_or_review_missing():
     service = get_service()
     thread = await service.create_thread()
 
     with pytest.raises(ValueError):
         await service.confirm_step(thread.thread_id, ConfirmStepRequest(step_id="course_title"))
+
+
+@pytest.mark.asyncio
+async def test_step_artifact_lifecycle_tracks_current_version():
+    service = get_service()
+    thread = await service.create_thread()
+    await service.ingest_message(
+        thread.thread_id,
+        "我要做一门入门课，给初中生，主题是三角函数，解决基础题不会做的问题，学完能独立完成基础题，风格实操带练，时长 60 分钟，要求基于真实案例。",
+        "default-user",
+    )
+    await service.ingest_message(thread.thread_id, "开始生成", "default-user")
+
+    state = await service.store.get_thread(thread.thread_id)
+    step_artifact = next(item for item in state.step_artifacts if item.step_id == "course_title")
+    assert step_artifact.current_version == state.draft_artifact.version
+    assert step_artifact.current_artifact_id == state.draft_artifact.artifact_id
+    assert step_artifact.status.value == "generated"
+    assert step_artifact.confirmed_version is None
 
     state = await service.store.get_thread(thread.thread_id)
     state.draft_artifact = DraftArtifact(version=1, markdown="# 标题", summary="标题")
